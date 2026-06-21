@@ -14,9 +14,9 @@ use crate::{
     run::{ClaimedRun, RunLease},
     task::Task,
     types::{
-        CreateQueueOptions, QueueDetachMode, QueueName, QueuePolicy, QueuePolicyOptions,
-        QueueStorageMode, RetryTaskOptions, RunId, SpawnOptions, SpawnResult, Spawned, TaskId,
-        TaskName, TaskResultSnapshot, TaskResultState,
+        CancellationPolicy, CreateQueueOptions, QueueDetachMode, QueueName, QueuePolicy,
+        QueuePolicyOptions, QueueStorageMode, RetryStrategy, RetryTaskOptions, RunId, SpawnOptions,
+        SpawnResult, Spawned, TaskId, TaskName, TaskResultSnapshot, TaskResultState,
     },
     worker::{ClaimOptions, ClaimStream, WorkerBuilder},
 };
@@ -171,6 +171,7 @@ impl Client {
             task_name: task.name().clone(),
             queue_name: task.queue_name().cloned(),
             default_max_attempts: task.default_max_attempts().or(self.default_max_attempts),
+            default_cancellation: task.default_cancellation().cloned(),
             params,
             options: SpawnOptions::default(),
             marker: PhantomData,
@@ -633,6 +634,8 @@ pub struct SpawnBuilder<P, R> {
     queue_name: Option<QueueName>,
     /// Carries the default maximum attempts.
     default_max_attempts: Option<i32>,
+    /// Carries the default cancellation policy.
+    default_cancellation: Option<CancellationPolicy>,
     /// Carries task parameters.
     params: P,
     /// Carries spawn options.
@@ -654,6 +657,24 @@ where
     /// Sets maximum attempts.
     pub fn max_attempts(mut self, max_attempts: i32) -> Self {
         self.options.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Sets retry behavior.
+    pub fn retry_strategy(mut self, retry_strategy: RetryStrategy) -> Self {
+        self.options.retry_strategy = Some(retry_strategy);
+        self
+    }
+
+    /// Sets application headers.
+    pub fn headers<T: Serialize>(mut self, headers: T) -> Result<Self> {
+        self.options.headers = Some(serde_json::to_value(headers).map_err(Error::json)?);
+        Ok(self)
+    }
+
+    /// Sets cancellation behavior.
+    pub fn cancellation(mut self, cancellation: CancellationPolicy) -> Self {
+        self.options.cancellation = Some(cancellation);
         self
     }
 
@@ -680,6 +701,9 @@ where
             }
         };
         self.options.queue_name = Some(queue_name.clone());
+        if self.options.cancellation.is_none() {
+            self.options.cancellation = self.default_cancellation.take();
+        }
         let result = self
             .client
             .spawn_raw(
