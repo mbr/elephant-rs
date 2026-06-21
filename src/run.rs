@@ -1,0 +1,128 @@
+//! Claimed run primitives.
+
+use std::{mem, time::Duration};
+
+use jiff::Timestamp;
+use serde::Serialize;
+use serde_json::Value;
+use tracing::warn;
+
+use crate::{
+    client::Client,
+    error::{FailureReason, Result},
+    types::{QueueName, RunId, TaskId, TaskName},
+};
+
+/// Represents a task run claimed from Absurd.
+#[derive(Debug)]
+pub struct ClaimedRun {
+    /// Identifies the queue containing the run.
+    pub queue_name: QueueName,
+    /// Identifies the run.
+    pub run_id: RunId,
+    /// Identifies the logical task.
+    pub task_id: TaskId,
+    /// Carries the attempt number.
+    pub attempt: i32,
+    /// Names the task handler.
+    pub task_name: TaskName,
+    /// Carries the raw parameter payload.
+    pub params: Value,
+    /// Carries the raw header payload.
+    pub headers: Option<Value>,
+    /// Carries the event that woke the run.
+    pub wake_event: Option<String>,
+    /// Carries the event payload that woke the run.
+    pub event_payload: Option<Value>,
+}
+
+/// Represents an active claimed run lease.
+#[derive(Debug)]
+#[must_use = "a run lease should be resolved, scheduled, or explicitly forgotten"]
+pub struct RunLease {
+    /// Holds the database client.
+    client: Client,
+    /// Holds the claimed run.
+    run: Option<ClaimedRun>,
+}
+
+impl RunLease {
+    /// Creates a run lease from a claimed run.
+    pub fn new(client: Client, run: ClaimedRun) -> Self {
+        Self {
+            client,
+            run: Some(run),
+        }
+    }
+
+    /// Returns the client that owns the lease.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Returns the claimed run metadata.
+    pub fn run(&self) -> &ClaimedRun {
+        self.run.as_ref().expect("run lease must contain a run")
+    }
+
+    /// Consumes the lease and returns the claimed run.
+    pub fn into_run(mut self) -> ClaimedRun {
+        self.take_run()
+    }
+
+    /// Completes the run with a serialized result.
+    pub async fn complete<T: Serialize>(mut self, result: T) -> Result<()> {
+        let run = self.take_run();
+        self.client
+            .complete_run(run.queue_name.as_str(), run.run_id.as_uuid(), result)
+            .await
+    }
+
+    /// Fails the run with a serialized failure reason.
+    pub async fn fail(mut self, reason: FailureReason) -> Result<()> {
+        let run = self.take_run();
+        self.client
+            .fail_run(run.queue_name.as_str(), run.run_id.as_uuid(), reason)
+            .await
+    }
+
+    /// Schedules the run to wake at an absolute timestamp.
+    pub async fn sleep_until(mut self, wake_at: Timestamp) -> Result<()> {
+        let run = self.take_run();
+        self.client
+            .schedule_run(run.queue_name.as_str(), run.run_id.as_uuid(), wake_at)
+            .await
+    }
+
+    /// Schedules the run to wake after a duration.
+    pub async fn sleep_for(self, duration: Duration) -> Result<()> {
+        let wake_at = Timestamp::now().saturating_add(duration)?;
+        self.sleep_until(wake_at).await
+    }
+
+    /// Explicitly abandons the lease.
+    pub fn forget(mut self) {
+        let _ = self.run.take();
+        mem::forget(self);
+    }
+
+    /// Removes the run from the lease.
+    fn take_run(&mut self) -> ClaimedRun {
+        self.run.take().expect("run lease must contain a run")
+    }
+}
+
+impl Drop for RunLease {
+    /// Reports unresolved leases without performing async cleanup.
+    fn drop(&mut self) {
+        if let Some(run) = &self.run {
+            warn!(
+                queue = %run.queue_name,
+                task_id = %run.task_id,
+                run_id = %run.run_id,
+                task_name = %run.task_name,
+                "run lease dropped without resolution"
+            );
+        }
+    }
+}
