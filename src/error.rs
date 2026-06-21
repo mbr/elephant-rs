@@ -101,13 +101,13 @@ impl Error {
 
     /// Maps database-specific Absurd states to typed errors.
     pub fn from_sqlx(source: SqlxError) -> Self {
-        if let SqlxError::Database(database) = &source {
-            if let Some(code) = database.code() {
-                match code.as_ref() {
-                    "AB001" => return Self::Cancelled,
-                    "AB002" => return Self::RunAlreadyFailed,
-                    _ => {}
-                }
+        if let SqlxError::Database(database) = &source
+            && let Some(code) = database.code()
+        {
+            match code.as_ref() {
+                "AB001" => return Self::Cancelled,
+                "AB002" => return Self::RunAlreadyFailed,
+                _ => {}
             }
         }
         Self::Sqlx { source }

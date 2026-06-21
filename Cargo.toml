@@ -25,4 +25,4 @@ tracing = "0.1.41"
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
 
 [dev-dependencies]
-pgdb = "0.1.0"
+pgdb = "0.6.0"

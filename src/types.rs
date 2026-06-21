@@ -650,14 +650,14 @@ fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> 
             reason: "must not be empty",
         });
     }
-    if let Some(max_bytes) = max_bytes {
-        if trimmed.len() > max_bytes {
-            return Err(Error::InvalidName {
-                kind,
-                value: value.to_string(),
-                reason: "is too long",
-            });
-        }
+    if let Some(max_bytes) = max_bytes
+        && trimmed.len() > max_bytes
+    {
+        return Err(Error::InvalidName {
+            kind,
+            value: value.to_string(),
+            reason: "is too long",
+        });
     }
     Ok(trimmed.to_string())
 }

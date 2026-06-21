@@ -498,10 +498,10 @@ impl Client {
         let started = std::time::Instant::now();
         let mut delay = Duration::from_millis(50);
         loop {
-            if let Some(snapshot) = self.fetch_task_result(queue_name.as_str(), task_id).await? {
-                if snapshot.is_terminal() {
-                    return Ok(snapshot);
-                }
+            if let Some(snapshot) = self.fetch_task_result(queue_name.as_str(), task_id).await?
+                && snapshot.is_terminal()
+            {
+                return Ok(snapshot);
             }
             if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
                 return Err(Error::TaskResultTimeout { task_id });
