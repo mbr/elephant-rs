@@ -9,14 +9,14 @@ use std::{
 };
 
 use jiff::Timestamp;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
     client::Client,
     error::{Error, Result},
     run::ClaimedRun,
-    types::{QueueName, RunId, StepName, TaskId, TaskName},
+    types::{EventName, QueueName, RunId, Spawned, StepName, TaskId, TaskName},
 };
 
 /// Carries metadata for an active task run.
@@ -132,6 +132,20 @@ impl TaskContext {
 
     /// Schedules the active run to resume at an absolute time.
     pub async fn sleep_until(&self, wake_at: Timestamp) -> Result<()> {
+        self.sleep_until_named("sleep", wake_at).await
+    }
+
+    /// Schedules the active run to resume at an absolute time under a name.
+    pub async fn sleep_until_named(
+        &self,
+        step_name: impl AsRef<str>,
+        wake_at: Timestamp,
+    ) -> Result<()> {
+        let step_name = step_name.as_ref().parse::<StepName>()?;
+        let wake_at = self.sleep_checkpoint(step_name.as_str(), wake_at).await?;
+        if Timestamp::now() >= wake_at {
+            return Ok(());
+        }
         self.client
             .schedule_run(
                 self.metadata.queue_name.as_str(),
@@ -144,8 +158,17 @@ impl TaskContext {
 
     /// Schedules the active run to resume after a duration.
     pub async fn sleep_for(&self, duration: Duration) -> Result<()> {
+        self.sleep_for_named("sleep", duration).await
+    }
+
+    /// Schedules the active run to resume after a duration under a name.
+    pub async fn sleep_for_named(
+        &self,
+        step_name: impl AsRef<str>,
+        duration: Duration,
+    ) -> Result<()> {
         let wake_at = Timestamp::now().saturating_add(duration)?;
-        self.sleep_until(wake_at).await
+        self.sleep_until_named(step_name, wake_at).await
     }
 
     /// Awaits an event or suspends the active run.
@@ -165,16 +188,45 @@ impl TaskContext {
     where
         T: DeserializeOwned,
     {
-        let event_name = event_name.as_ref();
+        let event_name = event_name.as_ref().parse::<EventName>()?;
         let step_name = format!("event:{event_name}");
+        self.await_event_named_with_timeout(step_name, event_name.as_str(), timeout)
+            .await
+    }
+
+    /// Awaits an event under an explicit checkpoint name.
+    pub async fn await_event_named<T>(
+        &self,
+        step_name: impl AsRef<str>,
+        event_name: impl AsRef<str>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.await_event_named_with_timeout(step_name, event_name, None)
+            .await
+    }
+
+    /// Awaits an event under an explicit checkpoint name and timeout.
+    pub async fn await_event_named_with_timeout<T>(
+        &self,
+        step_name: impl AsRef<str>,
+        event_name: impl AsRef<str>,
+        timeout: Option<Duration>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let step_name = step_name.as_ref().parse::<StepName>()?;
+        let event_name = event_name.as_ref().parse::<EventName>()?;
         let raw = self
             .client
             .await_event_raw(
                 self.metadata.queue_name.as_str(),
                 self.metadata.task_id.as_uuid(),
                 self.metadata.run_id.as_uuid(),
-                &step_name,
-                event_name,
+                step_name.as_str(),
+                event_name.as_str(),
                 timeout,
             )
             .await?;
@@ -210,6 +262,53 @@ impl TaskContext {
             .await
     }
 
+    /// Awaits a spawned task result from a different queue.
+    pub async fn await_task_result<R>(
+        &self,
+        spawned: &Spawned<R>,
+        queue_name: impl AsRef<str>,
+        timeout: Option<Duration>,
+    ) -> Result<Option<R>>
+    where
+        R: DeserializeOwned,
+    {
+        let queue_name = queue_name.as_ref().parse::<QueueName>()?;
+        if queue_name == self.metadata.queue_name {
+            return Err(Error::SameQueueWait);
+        }
+        self.client
+            .await_typed_task_result(
+                queue_name.as_str(),
+                spawned.result.task_id.as_uuid(),
+                timeout,
+            )
+            .await
+    }
+
+    /// Creates or reads a durable sleep checkpoint.
+    async fn sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<Timestamp> {
+        if let Some(value) = self.checkpoint_value(step_name)? {
+            let checkpoint: SleepCheckpoint = serde_json::from_value(value).map_err(Error::json)?;
+            return Ok(checkpoint.wake_at);
+        }
+        let checkpoint = SleepCheckpoint { wake_at };
+        self.client
+            .set_checkpoint(
+                self.metadata.queue_name.as_str(),
+                self.metadata.task_id.as_uuid(),
+                step_name,
+                &checkpoint,
+                self.metadata.run_id.as_uuid(),
+                self.checkpoint_extend_by,
+            )
+            .await?;
+        self.insert_checkpoint(
+            step_name,
+            serde_json::to_value(&checkpoint).map_err(Error::json)?,
+        )?;
+        Ok(wake_at)
+    }
+
     /// Fetches a cached checkpoint payload.
     fn checkpoint_value(&self, step_name: &str) -> Result<Option<Value>> {
         let guard = self
@@ -228,6 +327,13 @@ impl TaskContext {
         guard.insert(step_name.to_string(), value);
         Ok(())
     }
+}
+
+/// Describes a durable sleep checkpoint.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SleepCheckpoint {
+    /// Carries the time when the sleep should be complete.
+    wake_at: Timestamp,
 }
 
 /// Marks a pending step.

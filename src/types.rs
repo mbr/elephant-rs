@@ -2,7 +2,7 @@
 
 use std::{fmt, marker::PhantomData, str::FromStr, time::Duration};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Serialize, Serializer, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -288,18 +288,18 @@ impl fmt::Display for QueueStorageMode {
 /// Describes detached partition handling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueDetachMode {
-    /// Leaves detached partitions alone.
-    Keep,
-    /// Drops detached partitions during cleanup.
-    Drop,
+    /// Disables automatic partition detaching.
+    None,
+    /// Detaches empty partitions during cleanup.
+    Empty,
 }
 
 impl QueueDetachMode {
     /// Returns the value expected by Absurd.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Keep => "keep",
-            Self::Drop => "drop",
+            Self::None => "none",
+            Self::Empty => "empty",
         }
     }
 }
@@ -310,8 +310,8 @@ impl FromStr for QueueDetachMode {
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value {
-            "keep" => Ok(Self::Keep),
-            "drop" => Ok(Self::Drop),
+            "none" => Ok(Self::None),
+            "empty" => Ok(Self::Empty),
             _ => Err(()),
         }
     }
@@ -321,6 +321,68 @@ impl fmt::Display for QueueDetachMode {
     /// Formats the detach mode.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for QueueDetachMode {
+    /// Serializes the detach mode for Absurd.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Represents a PostgreSQL interval expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgInterval(String);
+
+impl PgInterval {
+    /// Returns the interval as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<Duration> for PgInterval {
+    /// Creates an interval from a duration.
+    fn from(value: Duration) -> Self {
+        Self(format!("{} seconds", value.as_secs()))
+    }
+}
+
+impl FromStr for PgInterval {
+    /// Parses an interval expression.
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Error::InvalidName {
+                kind: "interval",
+                value: value.to_string(),
+                reason: "must not be empty",
+            });
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+}
+
+impl fmt::Display for PgInterval {
+    /// Formats the interval expression.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for PgInterval {
+    /// Serializes the interval expression for PostgreSQL.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -348,22 +410,22 @@ impl Default for CreateQueueOptions {
 pub struct QueuePolicyOptions {
     /// Configures partition lookahead.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition_lookahead: Option<String>,
+    pub partition_lookahead: Option<PgInterval>,
     /// Configures partition lookback.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition_lookback: Option<String>,
+    pub partition_lookback: Option<PgInterval>,
     /// Configures cleanup time-to-live.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cleanup_ttl: Option<String>,
+    pub cleanup_ttl: Option<PgInterval>,
     /// Configures cleanup batch size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_limit: Option<i32>,
     /// Configures detached partition handling.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detach_mode: Option<String>,
+    pub detach_mode: Option<QueueDetachMode>,
     /// Configures detached partition minimum age.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detach_min_age: Option<String>,
+    pub detach_min_age: Option<PgInterval>,
 }
 
 impl QueuePolicyOptions {
@@ -615,6 +677,17 @@ impl TaskResultSnapshot {
             None => Ok(None),
         }
     }
+}
+
+/// Describes a cleanup result row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupResult {
+    /// Names the cleaned queue.
+    pub queue_name: QueueName,
+    /// Counts deleted tasks.
+    pub tasks_deleted: i32,
+    /// Counts deleted events.
+    pub events_deleted: i32,
 }
 
 /// Describes retry operation options.

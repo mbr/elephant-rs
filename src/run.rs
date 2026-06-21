@@ -1,6 +1,6 @@
 //! Claimed run primitives.
 
-use std::{mem, time::Duration};
+use std::time::Duration;
 
 use jiff::Timestamp;
 use serde::Serialize;
@@ -103,7 +103,6 @@ impl RunLease {
     /// Explicitly abandons the lease.
     pub fn forget(mut self) {
         let _ = self.run.take();
-        mem::forget(self);
     }
 
     /// Removes the run from the lease.

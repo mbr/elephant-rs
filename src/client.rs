@@ -14,9 +14,9 @@ use crate::{
     run::{ClaimedRun, RunLease},
     task::Task,
     types::{
-        CancellationPolicy, CreateQueueOptions, QueueDetachMode, QueueName, QueuePolicy,
-        QueuePolicyOptions, QueueStorageMode, RetryStrategy, RetryTaskOptions, RunId, SpawnOptions,
-        SpawnResult, Spawned, TaskId, TaskName, TaskResultSnapshot, TaskResultState,
+        CancellationPolicy, CleanupResult, CreateQueueOptions, QueueDetachMode, QueueName,
+        QueuePolicy, QueuePolicyOptions, QueueStorageMode, RetryStrategy, RetryTaskOptions, RunId,
+        SpawnOptions, SpawnResult, Spawned, TaskId, TaskName, TaskResultSnapshot, TaskResultState,
     },
     worker::{ClaimOptions, ClaimStream, WorkerBuilder},
 };
@@ -154,7 +154,7 @@ impl Client {
                     .map_err(Error::from_sqlx)?,
                 cleanup_ttl: row.try_get("cleanup_ttl").map_err(Error::from_sqlx)?,
                 cleanup_limit: row.try_get("cleanup_limit").map_err(Error::from_sqlx)?,
-                detach_mode: detach_mode.parse().unwrap_or(QueueDetachMode::Keep),
+                detach_mode: detach_mode.parse().unwrap_or(QueueDetachMode::None),
                 detach_min_age: row.try_get("detach_min_age").map_err(Error::from_sqlx)?,
             })
         })
@@ -557,13 +557,37 @@ impl Client {
     }
 
     /// Runs Absurd cleanup across queues.
-    pub async fn cleanup_all_queues(&self, options: Value) -> Result<()> {
-        sqlx::query("SELECT absurd.cleanup_all_queues($1::jsonb)")
-            .bind(Json(options))
-            .execute(&self.pool)
-            .await
-            .map_err(Error::from_sqlx)?;
-        Ok(())
+    pub async fn cleanup_all_queues(&self) -> Result<Vec<CleanupResult>> {
+        self.cleanup_queues(None).await
+    }
+
+    /// Runs Absurd cleanup for one queue.
+    pub async fn cleanup_queue(&self, queue_name: impl AsRef<str>) -> Result<Vec<CleanupResult>> {
+        let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        self.cleanup_queues(Some(queue_name)).await
+    }
+
+    /// Runs Absurd cleanup with an optional queue filter.
+    async fn cleanup_queues(&self, queue_name: Option<QueueName>) -> Result<Vec<CleanupResult>> {
+        let rows = sqlx::query(
+            "SELECT queue_name, tasks_deleted, events_deleted FROM absurd.cleanup_all_queues($1)",
+        )
+        .bind(queue_name.as_ref().map(QueueName::as_str))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Error::from_sqlx)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(CleanupResult {
+                    queue_name: QueueName::from_str(
+                        &row.try_get::<String, _>("queue_name")
+                            .map_err(Error::from_sqlx)?,
+                    )?,
+                    tasks_deleted: row.try_get("tasks_deleted").map_err(Error::from_sqlx)?,
+                    events_deleted: row.try_get("events_deleted").map_err(Error::from_sqlx)?,
+                })
+            })
+            .collect()
     }
 
     /// Spawns a task with normalized raw data.
