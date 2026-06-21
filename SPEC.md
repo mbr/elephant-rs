@@ -510,3 +510,66 @@ The first implementation should deliver a small but complete vertical slice:
 
 After that, add retry/cancel operations, queue policy APIs, cleanup helpers,
 lease watchdogs, richer hooks, and more ergonomic builders.
+
+## Release readiness
+
+The initial vertical slice is not production-ready until these gaps are closed.
+Treat the current implementation as an alpha SDK suitable for API iteration and
+integration testing.
+
+Durable sleeps must be replay-safe. `sleep_for` and `sleep_until` need a stable
+checkpoint or explicit sleep step identity so a resumed task observes that the
+sleep has completed instead of scheduling itself forever. The public API should
+support both ergonomic sleeps and explicit durable sleep names for loops or
+multiple waits.
+
+`RunLease::forget` must not leak memory. It should consume the lease and mark it
+abandoned locally, allowing owned resources such as the [`Client`] to drop
+normally while leaving the run unresolved in Absurd.
+
+The worker needs automatic lease management. `TaskContext::heartbeat` is useful,
+but production workers also need a configurable watchdog that extends active
+claims while handlers run, warns when extension fails, and treats Absurd
+cancellation or already-failed SQL states as runtime control flow.
+
+`await_event` should support explicit checkpoint names. A derived event-name
+checkpoint is acceptable for simple waits, but production workflows need stable
+names that can be versioned independently from event names and avoid collisions
+when the same event is awaited in multiple places.
+
+The test matrix must be expanded before release:
+
+- sleep scheduling and replay after wakeup;
+- idempotency key reuse;
+- cancellation and `AB001` mapping;
+- already-failed run and `AB002` mapping;
+- unknown-task deferral;
+- retry behavior and max-attempt exhaustion;
+- queue policy round-trips;
+- panic-to-failed-run conversion;
+- failed task result snapshots;
+- worker shutdown with in-flight tasks;
+- same-queue result waits being rejected;
+- explicit event wait names and repeated waits.
+
+`sqlx` usage needs a production decision. Prefer checked queries and offline
+metadata where the SQL shape is static. Where Absurd's dynamic queue tables make
+that impractical, keep runtime-checked queries small, typed by row structs, and
+covered by `pgdb` integration tests.
+
+Operational APIs need harder validation. Queue policies, retry options,
+cancellation policies, cleanup options, and interval-like strings should either
+be typed or explicitly documented as database-validated fields.
+
+Documentation must be expanded before publishing. The README and crate docs need
+examples for the manual claim loop, convenience worker, typed spawning, durable
+steps, sleeps, events, retries, cancellation, and idempotent side effects. They
+must clearly state Absurd's at-least-once execution semantics and checkpoint
+compatibility rules.
+
+The pinned `testdata/absurd.sql` fixture should record its upstream revision and
+have a deliberate update process. Test failures from schema changes should be
+reviewed as compatibility changes, not treated as incidental fixture churn.
+
+Publishing readiness also requires license files, crate metadata review, docs.rs
+configuration if needed, and a dry-run publish check.
