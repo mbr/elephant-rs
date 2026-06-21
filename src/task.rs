@@ -1,8 +1,13 @@
 //! Typed task definitions and routing.
 
 use std::{
-    collections::HashMap, error, future::Future, marker::PhantomData, panic::AssertUnwindSafe,
-    sync::Arc, time::Duration,
+    collections::HashMap,
+    error,
+    future::Future,
+    marker::PhantomData,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+    time::Duration,
 };
 
 use futures::{FutureExt, future::BoxFuture};
@@ -13,7 +18,7 @@ use serde_json::Value;
 use crate::{
     context::TaskContext,
     error::{Error, FailureReason, Result},
-    run::{ClaimedRun, RunLease},
+    run::RunLease,
     types::{CancellationPolicy, QueueName, TaskName},
 };
 
@@ -145,8 +150,11 @@ where
                     Ok(params) => params,
                     Err(error) => return Box::pin(async move { Err(error) }),
                 };
-                let future = (self.handler)(context, params);
+                let future = catch_unwind(AssertUnwindSafe(|| (self.handler)(context, params)));
                 Box::pin(async move {
+                    let Ok(future) = future else {
+                        return Err(Error::HandlerPanicked);
+                    };
                     let result = AssertUnwindSafe(future).catch_unwind().await;
                     match result {
                         Ok(value) => serde_json::to_value(value?).map_err(Error::json),
@@ -213,9 +221,9 @@ impl Router {
     /// Dispatches a claimed run.
     pub async fn dispatch(&self, lease: RunLease) -> Result<()> {
         let client = lease.client().clone();
-        let run = lease.into_run();
+        let run = lease.claimed_run().clone();
         let Some(task) = self.tasks.get(&run.task_name).cloned() else {
-            return self.defer_unknown(client, run).await;
+            return self.defer_unknown(lease).await;
         };
         let checkpoints = client
             .get_checkpoints(
@@ -226,31 +234,28 @@ impl Router {
             .await?
             .into_iter()
             .collect();
-        let context = TaskContext::new(client.clone(), &run, checkpoints);
+        let context = TaskContext::new(client, &run, checkpoints);
         match task.handle(context, run.params).await {
-            Ok(result) => {
-                client
-                    .complete_run(run.queue_name.as_str(), run.run_id.as_uuid(), result)
-                    .await
+            Ok(result) => complete_lease(lease, result).await,
+            Err(Error::Suspended | Error::Cancelled | Error::RunAlreadyFailed) => {
+                lease.forget();
+                Ok(())
             }
-            Err(Error::Suspended) => Ok(()),
-            Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
             Err(error) => {
                 let reason = failure_reason(&error);
-                client
-                    .fail_run(run.queue_name.as_str(), run.run_id.as_uuid(), reason)
-                    .await
+                fail_lease(lease, reason).await
             }
         }
     }
 
     /// Defers a run with an unknown task name.
-    async fn defer_unknown(&self, client: crate::client::Client, run: ClaimedRun) -> Result<()> {
-        let jitter = rand::rng().random_range(0..=self.unknown_task_delay.as_secs());
-        let wake_at = jiff::Timestamp::now().saturating_add(Duration::from_secs(jitter))?;
-        client
-            .schedule_run(run.queue_name.as_str(), run.run_id.as_uuid(), wake_at)
-            .await
+    async fn defer_unknown(&self, lease: RunLease) -> Result<()> {
+        let jitter = jitter_duration(self.unknown_task_delay);
+        let wake_at = jiff::Timestamp::now().saturating_add(jitter)?;
+        match lease.sleep_until(wake_at).await {
+            Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -275,11 +280,42 @@ impl ErasedTask {
     }
 }
 
+/// Completes a lease while treating terminal races as control flow.
+async fn complete_lease(lease: RunLease, result: Value) -> Result<()> {
+    match lease.complete(result).await {
+        Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Fails a lease while treating terminal races as control flow.
+async fn fail_lease(lease: RunLease, reason: FailureReason) -> Result<()> {
+    match lease.fail(reason).await {
+        Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns a jitter duration up to the provided maximum.
+fn jitter_duration(maximum: Duration) -> Duration {
+    let millis = maximum.as_millis();
+    if millis == 0 {
+        return Duration::ZERO;
+    }
+    let upper = u64::try_from(millis).unwrap_or(u64::MAX);
+    Duration::from_millis(rand::rng().random_range(0..=upper))
+}
+
 /// Converts a handler error into an Absurd failure payload.
 fn failure_reason(error: &Error) -> FailureReason {
     match error {
-        Error::Handler { source } => FailureReason::from_error(source.as_ref()),
+        Error::Handler { source } => {
+            FailureReason::from_error_named("handler_error", source.as_ref())
+        }
         Error::HandlerPanicked => FailureReason::panic(),
-        _ => FailureReason::from_error(error as &(dyn error::Error + Send + Sync)),
+        _ => FailureReason::from_error_named(
+            "room_error",
+            error as &(dyn error::Error + Send + Sync),
+        ),
     }
 }

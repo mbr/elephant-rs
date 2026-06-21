@@ -14,9 +14,10 @@ use crate::{
     run::{ClaimedRun, RunLease},
     task::Task,
     types::{
-        CancellationPolicy, CleanupResult, CreateQueueOptions, QueueDetachMode, QueueName,
-        QueuePolicy, QueuePolicyOptions, QueueStorageMode, RetryStrategy, RetryTaskOptions, RunId,
-        SpawnOptions, SpawnResult, Spawned, TaskId, TaskName, TaskResultSnapshot, TaskResultState,
+        CancellationPolicy, CheckpointSnapshot, CleanupResult, CreateQueueOptions, EventName,
+        QueueName, QueuePolicy, QueuePolicyOptions, RetryStrategy, RetryTaskOptions, RunId,
+        SpawnOptions, SpawnResult, Spawned, StepName, TaskId, TaskName, TaskResultSnapshot,
+        TaskResultState,
     },
     worker::{ClaimOptions, ClaimStream, WorkerBuilder},
 };
@@ -143,9 +144,11 @@ impl Client {
                 .map_err(Error::from_sqlx)?;
             Ok(QueuePolicy {
                 queue_name: QueueName::from_str(&queue_name)?,
-                storage_mode: storage_mode
-                    .parse()
-                    .unwrap_or(QueueStorageMode::Unpartitioned),
+                storage_mode: storage_mode.parse().map_err(|()| Error::InvalidName {
+                    kind: "queue storage mode",
+                    value: storage_mode.clone(),
+                    reason: "is not supported",
+                })?,
                 partition_lookahead: row
                     .try_get("partition_lookahead")
                     .map_err(Error::from_sqlx)?,
@@ -154,7 +157,11 @@ impl Client {
                     .map_err(Error::from_sqlx)?,
                 cleanup_ttl: row.try_get("cleanup_ttl").map_err(Error::from_sqlx)?,
                 cleanup_limit: row.try_get("cleanup_limit").map_err(Error::from_sqlx)?,
-                detach_mode: detach_mode.parse().unwrap_or(QueueDetachMode::None),
+                detach_mode: detach_mode.parse().map_err(|()| Error::InvalidName {
+                    kind: "queue detach mode",
+                    value: detach_mode,
+                    reason: "is not supported",
+                })?,
                 detach_min_age: row.try_get("detach_min_age").map_err(Error::from_sqlx)?,
             })
         })
@@ -342,11 +349,12 @@ impl Client {
         extend_claim_by: Option<Duration>,
     ) -> Result<()> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        let step_name = StepName::from_str(step_name.as_ref())?;
         let payload = serde_json::to_value(state).map_err(Error::json)?;
         sqlx::query("SELECT absurd.set_task_checkpoint_state($1, $2, $3, $4::jsonb, $5, $6)")
             .bind(queue_name.as_str())
             .bind(task_id)
-            .bind(step_name.as_ref())
+            .bind(step_name.as_str())
             .bind(Json(payload))
             .bind(owner_run)
             .bind(extend_claim_by.map(seconds_i32).transpose()?)
@@ -354,6 +362,30 @@ impl Client {
             .await
             .map_err(Error::from_sqlx)?;
         Ok(())
+    }
+
+    /// Fetches one committed checkpoint by name.
+    pub async fn get_checkpoint(
+        &self,
+        queue_name: impl AsRef<str>,
+        task_id: Uuid,
+        step_name: impl AsRef<str>,
+        include_pending: bool,
+    ) -> Result<Option<CheckpointSnapshot>> {
+        let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        let step_name = StepName::from_str(step_name.as_ref())?;
+        let row = sqlx::query(
+            "SELECT checkpoint_name, state, status, owner_run_id, updated_at::text AS updated_at \
+             FROM absurd.get_task_checkpoint_state($1, $2, $3, $4)",
+        )
+        .bind(queue_name.as_str())
+        .bind(task_id)
+        .bind(step_name.as_str())
+        .bind(include_pending)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Error::from_sqlx)?;
+        row.map(row_to_checkpoint).transpose()
     }
 
     /// Fetches all visible checkpoints for a run.
@@ -396,6 +428,8 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<AwaitEventRaw> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        let step_name = StepName::from_str(step_name.as_ref())?;
+        let event_name = EventName::from_str(event_name.as_ref())?;
         let timeout = timeout.map(seconds_i32).transpose()?;
         let row = sqlx::query(
             "SELECT should_suspend, payload FROM absurd.await_event($1, $2, $3, $4, $5, $6)",
@@ -403,8 +437,8 @@ impl Client {
         .bind(queue_name.as_str())
         .bind(task_id)
         .bind(run_id)
-        .bind(step_name.as_ref())
-        .bind(event_name.as_ref())
+        .bind(step_name.as_str())
+        .bind(event_name.as_str())
         .bind(timeout)
         .fetch_one(&self.pool)
         .await
@@ -426,10 +460,11 @@ impl Client {
         payload: T,
     ) -> Result<()> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        let event_name = EventName::from_str(event_name.as_ref())?;
         let payload = serde_json::to_value(payload).map_err(Error::json)?;
         sqlx::query("SELECT absurd.emit_event($1, $2, $3::jsonb)")
             .bind(queue_name.as_str())
-            .bind(event_name.as_ref())
+            .bind(event_name.as_str())
             .bind(Json(payload))
             .execute(&self.pool)
             .await
@@ -512,16 +547,16 @@ impl Client {
         }
     }
 
-    /// Awaits and decodes a typed task result.
+    /// Awaits and decodes a successful typed task result.
     pub async fn await_typed_task_result<R: DeserializeOwned>(
         &self,
         queue_name: impl AsRef<str>,
         task_id: Uuid,
         timeout: Option<Duration>,
-    ) -> Result<Option<R>> {
+    ) -> Result<R> {
         self.await_task_result(queue_name, task_id, timeout)
             .await?
-            .decode()
+            .decode_completed(TaskId::from(task_id))
     }
 
     /// Retries a task.
@@ -731,14 +766,14 @@ where
         let result = self
             .client
             .spawn_raw(
-                queue_name,
+                queue_name.clone(),
                 self.task_name,
                 self.params,
                 self.options,
                 self.default_max_attempts,
             )
             .await?;
-        Ok(Spawned::new(result))
+        Ok(Spawned::new(queue_name, result))
     }
 }
 
@@ -746,15 +781,14 @@ impl<R> Spawned<R>
 where
     R: DeserializeOwned,
 {
-    /// Awaits and decodes this spawned task's result.
-    pub async fn await_result(
-        &self,
-        client: &Client,
-        queue_name: impl AsRef<str>,
-        timeout: Option<Duration>,
-    ) -> Result<Option<R>> {
+    /// Awaits and decodes this spawned task's successful result.
+    pub async fn await_result(&self, client: &Client, timeout: Option<Duration>) -> Result<R> {
         client
-            .await_typed_task_result(queue_name, self.result.task_id.as_uuid(), timeout)
+            .await_typed_task_result(
+                self.queue_name.as_str(),
+                self.result.task_id.as_uuid(),
+                timeout,
+            )
             .await
     }
 }
@@ -766,6 +800,26 @@ pub struct AwaitEventRaw {
     pub should_suspend: bool,
     /// Carries the event payload when available.
     pub payload: Option<Value>,
+}
+
+/// Converts a row into a checkpoint snapshot.
+fn row_to_checkpoint(row: sqlx::postgres::PgRow) -> Result<CheckpointSnapshot> {
+    Ok(CheckpointSnapshot {
+        checkpoint_name: StepName::from_str(
+            &row.try_get::<String, _>("checkpoint_name")
+                .map_err(Error::from_sqlx)?,
+        )?,
+        state: row
+            .try_get::<Json<Value>, _>("state")
+            .map_err(Error::from_sqlx)?
+            .0,
+        status: row.try_get("status").map_err(Error::from_sqlx)?,
+        owner_run_id: row
+            .try_get::<Option<Uuid>, _>("owner_run_id")
+            .map_err(Error::from_sqlx)?
+            .map(RunId::from),
+        updated_at: row.try_get("updated_at").map_err(Error::from_sqlx)?,
+    })
 }
 
 /// Converts a row into a spawn result.
@@ -783,5 +837,6 @@ fn row_to_spawn_result(row: sqlx::postgres::PgRow) -> Result<SpawnResult> {
 
 /// Converts a duration to Absurd seconds.
 fn seconds_i32(duration: Duration) -> Result<i32> {
-    i32::try_from(duration.as_secs()).map_err(Error::duration_out_of_range)
+    let seconds = duration.as_secs() + u64::from(duration.subsec_nanos() > 0);
+    i32::try_from(seconds).map_err(Error::duration_out_of_range)
 }

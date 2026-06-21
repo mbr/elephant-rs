@@ -516,6 +516,30 @@ lease watchdogs, richer hooks, and more ergonomic builders.
 The release-ready SDK must keep the core correctness properties covered by code
 and integration tests.
 
+The current release-readiness review resolved these implementation issues:
+
+- typed spawn handles retain their queue and await results without a separate
+  queue argument;
+- typed result awaiting treats failed, cancelled, and missing-result states as
+  errors instead of returning `None`;
+- task dispatch catches panics both while constructing and polling handler
+  futures;
+- router dispatch resolves runs through `RunLease` terminal methods and only
+  forgets leases for database-controlled terminal or suspended states;
+- queue-name validation uses Absurd's byte limit and does not rewrite accepted
+  names by trimming them;
+- `RetryStrategy::None` disables automatic retry by forcing a single attempt
+  when explicitly selected;
+- the decomposed step API does not expose impossible public typestate variants;
+- failure payloads use stable category names instead of display strings as
+  failure names;
+- public event and checkpoint wrappers validate names before calling stored
+  procedures;
+- the single-checkpoint stored procedure wrapper is exposed;
+- duration conversion to Absurd integer seconds rounds non-zero subsecond
+  durations up instead of truncating to zero;
+- unknown-task deferral jitter preserves subsecond delays.
+
 Durable sleeps are replay-safe. `sleep_for` and `sleep_until` use a default
 checkpoint, and `sleep_for_named` and `sleep_until_named` provide explicit stable
 sleep identities for loops or multiple waits.

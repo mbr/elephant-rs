@@ -79,6 +79,20 @@ pub enum Error {
     /// Indicates that a task run suspended itself.
     #[error("task run suspended")]
     Suspended,
+    /// Indicates that a task finished without a decodable result.
+    #[error("task {task_id} completed without a result")]
+    TaskResultMissing {
+        /// Identifies the task whose result was awaited.
+        task_id: uuid::Uuid,
+    },
+    /// Indicates that a task completed with a failed state.
+    #[error("task {task_id} failed")]
+    TaskFailed {
+        /// Identifies the task whose result was awaited.
+        task_id: uuid::Uuid,
+        /// Carries the recorded failure payload.
+        failure: Option<serde_json::Value>,
+    },
     /// Indicates that a task result wait reached its timeout.
     #[error("timed out waiting for task {task_id}")]
     TaskResultTimeout {
@@ -171,9 +185,26 @@ pub struct FailureReason {
 impl FailureReason {
     /// Creates a failure reason from an error display value.
     pub fn from_error(error: &(dyn error::Error + Send + Sync)) -> Self {
+        Self::from_error_named("error", error)
+    }
+
+    /// Creates a failure reason with a stable category name.
+    pub fn from_error_named(
+        name: impl Into<String>,
+        error: &(dyn error::Error + Send + Sync),
+    ) -> Self {
         Self {
-            name: error.to_string(),
+            name: name.into(),
             message: format_error(error),
+            traceback: None,
+        }
+    }
+
+    /// Creates a failure reason from parts.
+    pub fn from_parts(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            message: message.into(),
             traceback: None,
         }
     }

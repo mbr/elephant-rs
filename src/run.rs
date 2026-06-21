@@ -1,6 +1,6 @@
 //! Claimed run primitives.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use jiff::Timestamp;
 use serde::Serialize;
@@ -9,12 +9,12 @@ use tracing::warn;
 
 use crate::{
     client::Client,
-    error::{FailureReason, Result},
+    error::{Error, FailureReason, Result},
     types::{QueueName, RunId, TaskId, TaskName},
 };
 
 /// Represents a task run claimed from Absurd.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ClaimedRun {
     /// Identifies the queue containing the run.
     pub queue_name: QueueName,
@@ -61,7 +61,7 @@ impl RunLease {
     }
 
     /// Returns the claimed run metadata.
-    pub fn run(&self) -> &ClaimedRun {
+    pub fn claimed_run(&self) -> &ClaimedRun {
         self.run.as_ref().expect("run lease must contain a run")
     }
 
@@ -72,26 +72,63 @@ impl RunLease {
 
     /// Completes the run with a serialized result.
     pub async fn complete<T: Serialize>(mut self, result: T) -> Result<()> {
-        let run = self.take_run();
-        self.client
-            .complete_run(run.queue_name.as_str(), run.run_id.as_uuid(), result)
-            .await
+        let queue_name = self.claimed_run().queue_name.clone();
+        let run_id = self.claimed_run().run_id;
+        let outcome = self
+            .client
+            .complete_run(queue_name.as_str(), run_id.as_uuid(), result)
+            .await;
+        if is_resolved_outcome(&outcome) {
+            self.run.take();
+        }
+        outcome
     }
 
     /// Fails the run with a serialized failure reason.
     pub async fn fail(mut self, reason: FailureReason) -> Result<()> {
-        let run = self.take_run();
-        self.client
-            .fail_run(run.queue_name.as_str(), run.run_id.as_uuid(), reason)
-            .await
+        let queue_name = self.claimed_run().queue_name.clone();
+        let run_id = self.claimed_run().run_id;
+        let outcome = self
+            .client
+            .fail_run(queue_name.as_str(), run_id.as_uuid(), reason)
+            .await;
+        if is_resolved_outcome(&outcome) {
+            self.run.take();
+        }
+        outcome
+    }
+
+    /// Runs work and resolves the lease from its outcome.
+    pub async fn run<T, Fut>(self, future: Fut) -> Result<()>
+    where
+        T: Serialize,
+        Fut: Future<Output = Result<T>>,
+    {
+        match future.await {
+            Ok(result) => self.complete(result).await,
+            Err(Error::Suspended | Error::Cancelled | Error::RunAlreadyFailed) => {
+                self.forget();
+                Ok(())
+            }
+            Err(error) => {
+                let reason = failure_reason(&error);
+                self.fail(reason).await
+            }
+        }
     }
 
     /// Schedules the run to wake at an absolute timestamp.
     pub async fn sleep_until(mut self, wake_at: Timestamp) -> Result<()> {
-        let run = self.take_run();
-        self.client
-            .schedule_run(run.queue_name.as_str(), run.run_id.as_uuid(), wake_at)
-            .await
+        let queue_name = self.claimed_run().queue_name.clone();
+        let run_id = self.claimed_run().run_id;
+        let outcome = self
+            .client
+            .schedule_run(queue_name.as_str(), run_id.as_uuid(), wake_at)
+            .await;
+        if is_resolved_outcome(&outcome) {
+            self.run.take();
+        }
+        outcome
     }
 
     /// Schedules the run to wake after a duration.
@@ -108,6 +145,25 @@ impl RunLease {
     /// Removes the run from the lease.
     fn take_run(&mut self) -> ClaimedRun {
         self.run.take().expect("run lease must contain a run")
+    }
+}
+
+/// Returns whether an operation resolved the local lease obligation.
+fn is_resolved_outcome(outcome: &Result<()>) -> bool {
+    matches!(
+        outcome,
+        Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed)
+    )
+}
+
+/// Converts a room error into a stable failure reason.
+fn failure_reason(error: &Error) -> FailureReason {
+    match error {
+        Error::Handler { source } => {
+            FailureReason::from_error_named("handler_error", source.as_ref())
+        }
+        Error::HandlerPanicked => FailureReason::panic(),
+        _ => FailureReason::from_error_named("room_error", error),
     }
 }
 

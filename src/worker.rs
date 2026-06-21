@@ -280,7 +280,7 @@ async fn dispatch_with_watchdog(
     let Some(options) = options else {
         return router.dispatch(lease).await;
     };
-    let metadata = LeaseMetadata::from_run(lease.run());
+    let metadata = LeaseMetadata::from_run(lease.claimed_run());
     let client = lease.client().clone();
     let shutdown = CancellationToken::new();
     let watchdog = tokio::spawn(watch_lease(client, metadata, options, shutdown.clone()));

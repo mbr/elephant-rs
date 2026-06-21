@@ -110,7 +110,7 @@ impl TaskContext {
     }
 
     /// Begins a decomposed durable step.
-    pub async fn begin_step<T>(&self, step_name: impl AsRef<str>) -> Result<Step<T, Pending>>
+    pub async fn begin_step<T>(&self, step_name: impl AsRef<str>) -> Result<Step<T>>
     where
         T: DeserializeOwned + Serialize,
     {
@@ -266,14 +266,13 @@ impl TaskContext {
     pub async fn await_task_result<R>(
         &self,
         spawned: &Spawned<R>,
-        queue_name: impl AsRef<str>,
         timeout: Option<Duration>,
-    ) -> Result<Option<R>>
+    ) -> Result<R>
     where
         R: DeserializeOwned,
     {
-        let queue_name = queue_name.as_ref().parse::<QueueName>()?;
-        if queue_name == self.metadata.queue_name {
+        let queue_name = &spawned.queue_name;
+        if queue_name == &self.metadata.queue_name {
             return Err(Error::SameQueueWait);
         }
         self.client
@@ -346,13 +345,11 @@ pub struct Done;
 
 /// Represents a durable step state.
 #[derive(Debug)]
-pub enum Step<T, S> {
+pub enum Step<T> {
     /// Carries a completed step.
     Done(DoneStep<T>),
     /// Carries a pending step.
     Pending(PendingStep<T>),
-    /// Carries the typestate marker.
-    Marker(PhantomData<S>),
 }
 
 /// Represents a completed durable step.

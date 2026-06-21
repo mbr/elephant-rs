@@ -38,6 +38,9 @@ struct Output {
     value: i32,
 }
 
+/// Represents fallible test completion.
+type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
+
 /// Owns an ephemeral test database.
 struct TestDb {
     /// Keeps the database fixture alive.
@@ -96,9 +99,8 @@ async fn spawned_task_completes_through_router() -> Result<(), Box<dyn StdError 
     let spawned = test.client.spawn(&task, Input { value: 42 }).send().await?;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("completed task should have a result");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 42 });
     Ok(())
@@ -141,9 +143,8 @@ async fn checkpoint_replay_skips_completed_step() -> Result<(), Box<dyn StdError
     work_batch(&test.client, &router, "default").await?;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("completed task should have a result");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 7 });
     assert_eq!(step_calls.load(Ordering::SeqCst), 1);
@@ -170,9 +171,8 @@ async fn event_wait_resumes_after_emit() -> Result<(), Box<dyn StdError + Send +
         .await?;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("completed task should have a result");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 99 });
     Ok(())
@@ -211,9 +211,8 @@ async fn sleep_replays_after_wakeup() -> Result<(), Box<dyn StdError + Send + Sy
     tokio::time::sleep(Duration::from_millis(150)).await;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("completed task should have a result");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 5 });
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -347,6 +346,43 @@ async fn panic_becomes_failed_task_result() -> Result<(), Box<dyn StdError + Sen
         )
         .await?;
 
+    let typed_error = spawned
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await
+        .expect_err("typed await should surface failed tasks");
+
+    assert_eq!(snapshot.state, TaskResultState::Failed);
+    assert!(snapshot.failure.is_some());
+    assert!(matches!(typed_error, Error::TaskFailed { .. }));
+    Ok(())
+}
+
+/// Verifies panic conversion covers handler construction.
+#[tokio::test]
+async fn synchronous_panic_becomes_failed_task_result() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<Input, Output>::builder("sync-panic-task")?
+        .queue("default")?
+        .default_max_attempts(1)
+        .handler(
+            |_context, _input| -> std::future::Ready<room::error::Result<Output>> {
+                panic!("intentional synchronous panic")
+            },
+        )
+        .build();
+    let router = Router::new().task(task.clone())?;
+
+    let spawned = test.client.spawn(&task, Input { value: 0 }).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    let snapshot = test
+        .client
+        .await_task_result(
+            "default",
+            spawned.result.task_id.as_uuid(),
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+
     assert_eq!(snapshot.state, TaskResultState::Failed);
     assert!(snapshot.failure.is_some());
     Ok(())
@@ -376,15 +412,16 @@ async fn retry_strategy_runs_later_attempt() -> Result<(), Box<dyn StdError + Se
     let spawned = test
         .client
         .spawn(&task, Input { value: 0 })
-        .retry_strategy(RetryStrategy::None)
+        .retry_strategy(RetryStrategy::Fixed {
+            base: Duration::ZERO,
+        })
         .send()
         .await?;
     work_batch(&test.client, &router, "default").await?;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("retried task should complete");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 11 });
     Ok(())
@@ -436,7 +473,7 @@ async fn same_queue_task_wait_is_rejected() -> Result<(), Box<dyn StdError + Sen
                     .send()
                     .await?;
                 match context
-                    .await_task_result(&spawned, "default", Some(Duration::from_millis(1)))
+                    .await_task_result(&spawned, Some(Duration::from_millis(1)))
                     .await
                 {
                     Err(Error::SameQueueWait) => Ok(Output { value: 1 }),
@@ -455,9 +492,8 @@ async fn same_queue_task_wait_is_rejected() -> Result<(), Box<dyn StdError + Sen
         .await?;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("parent should complete");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 1 });
     Ok(())
@@ -487,9 +523,8 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
         .await?;
     work_batch(&test.client, &router, "default").await?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("event task should complete");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 40 });
     Ok(())
@@ -534,9 +569,8 @@ async fn worker_shutdown_waits_for_in_flight_task() -> Result<(), Box<dyn StdErr
         .await
         .expect("worker task should join without panicking")?;
     let result = spawned
-        .await_result(&test.client, "default", Some(Duration::from_secs(5)))
-        .await?
-        .expect("worker should finish in-flight task");
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
 
     assert_eq!(result, Output { value: 33 });
     Ok(())

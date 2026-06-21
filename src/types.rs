@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 
 /// Defines Absurd's queue-name byte limit.
-pub const MAX_QUEUE_NAME_BYTES: usize = 50;
+pub const MAX_QUEUE_NAME_BYTES: usize = 57;
 
 /// Represents a validated queue name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -556,7 +556,11 @@ impl SpawnOptions {
     /// Converts spawn options to Absurd JSON.
     pub fn to_json(&self, default_max_attempts: Option<i32>) -> Value {
         let mut value = serde_json::Map::new();
-        if let Some(max_attempts) = self.max_attempts.or(default_max_attempts) {
+        let mut max_attempts = self.max_attempts.or(default_max_attempts);
+        if matches!(self.retry_strategy, Some(RetryStrategy::None)) {
+            max_attempts = Some(1);
+        }
+        if let Some(max_attempts) = max_attempts {
             value.insert("max_attempts".to_string(), serde_json::json!(max_attempts));
         }
         if let Some(retry_strategy) = &self.retry_strategy {
@@ -594,6 +598,8 @@ pub struct SpawnResult {
 /// Represents a typed spawned task handle.
 #[derive(Clone, Debug)]
 pub struct Spawned<R> {
+    /// Names the queue containing the task.
+    pub queue_name: QueueName,
     /// Carries the untyped spawn result.
     pub result: SpawnResult,
     /// Carries the result type marker.
@@ -602,8 +608,9 @@ pub struct Spawned<R> {
 
 impl<R> Spawned<R> {
     /// Creates a typed spawned task handle.
-    pub fn new(result: SpawnResult) -> Self {
+    pub fn new(queue_name: QueueName, result: SpawnResult) -> Self {
         Self {
+            queue_name,
             result,
             marker: PhantomData,
         }
@@ -668,7 +675,7 @@ impl TaskResultSnapshot {
         self.state.is_terminal()
     }
 
-    /// Decodes a completed task result.
+    /// Decodes a task result without interpreting task state.
     pub fn decode<R: DeserializeOwned>(&self) -> Result<Option<R>> {
         match &self.result {
             Some(value) => serde_json::from_value(value.clone())
@@ -677,6 +684,41 @@ impl TaskResultSnapshot {
             None => Ok(None),
         }
     }
+
+    /// Decodes a successful terminal task result.
+    pub fn decode_completed<R: DeserializeOwned>(&self, task_id: TaskId) -> Result<R> {
+        match self.state {
+            TaskResultState::Completed => match &self.result {
+                Some(value) => serde_json::from_value(value.clone()).map_err(Error::json),
+                None => Err(Error::TaskResultMissing {
+                    task_id: task_id.as_uuid(),
+                }),
+            },
+            TaskResultState::Cancelled => Err(Error::Cancelled),
+            TaskResultState::Failed => Err(Error::TaskFailed {
+                task_id: task_id.as_uuid(),
+                failure: self.failure.clone(),
+            }),
+            _ => Err(Error::TaskResultTimeout {
+                task_id: task_id.as_uuid(),
+            }),
+        }
+    }
+}
+
+/// Describes a checkpoint state row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckpointSnapshot {
+    /// Names the checkpoint.
+    pub checkpoint_name: StepName,
+    /// Carries the checkpoint payload.
+    pub state: Value,
+    /// Carries the storage status.
+    pub status: String,
+    /// Identifies the run that wrote the row.
+    pub owner_run_id: Option<RunId>,
+    /// Carries the update timestamp as reported by PostgreSQL.
+    pub updated_at: String,
 }
 
 /// Describes a cleanup result row.
@@ -715,8 +757,7 @@ impl RetryTaskOptions {
 
 /// Validates a named string.
 fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    if value.trim().is_empty() {
         return Err(Error::InvalidName {
             kind,
             value: value.to_string(),
@@ -724,7 +765,7 @@ fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> 
         });
     }
     if let Some(max_bytes) = max_bytes
-        && trimmed.len() > max_bytes
+        && value.len() > max_bytes
     {
         return Err(Error::InvalidName {
             kind,
@@ -732,18 +773,28 @@ fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> 
             reason: "is too long",
         });
     }
-    Ok(trimmed.to_string())
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use crate::types::{QueueName, RetryStrategy, TaskName};
+    use crate::types::{MAX_QUEUE_NAME_BYTES, QueueName, RetryStrategy, SpawnOptions, TaskName};
 
     #[test]
     fn names_validate_basic_constraints() {
         assert!("default".parse::<QueueName>().is_ok());
+        assert!(
+            "a".repeat(MAX_QUEUE_NAME_BYTES)
+                .parse::<QueueName>()
+                .is_ok()
+        );
+        assert!(
+            "a".repeat(MAX_QUEUE_NAME_BYTES + 1)
+                .parse::<QueueName>()
+                .is_err()
+        );
         assert!("".parse::<QueueName>().is_err());
         assert!("task".parse::<TaskName>().is_ok());
     }
@@ -755,8 +806,13 @@ mod tests {
             factor: 3.0,
             max: Some(Duration::from_secs(60)),
         };
+        let options = SpawnOptions {
+            retry_strategy: Some(RetryStrategy::None),
+            ..SpawnOptions::default()
+        };
 
         assert_eq!(retry.to_json()["kind"], "exponential");
         assert_eq!(retry.to_json()["max_seconds"], 60.0);
+        assert_eq!(options.to_json(Some(5))["max_attempts"], 1);
     }
 }
