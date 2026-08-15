@@ -19,9 +19,6 @@ jobs:
       - name: Check
         run: |
           nix develop --command ./check.sh
-      - name: Test
-        run: |
-          nix develop --command cargo test
       - name: Build
         run: |-
           nix build

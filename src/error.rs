@@ -69,6 +69,14 @@ pub enum Error {
     /// Indicates that Absurd is not installed in the database.
     #[error("absurd schema is not installed")]
     SchemaNotInstalled,
+    /// Indicates that the installed Absurd schema is not compatible.
+    #[error("absurd schema version {actual:?} does not match expected version {expected:?}")]
+    SchemaVersionMismatch {
+        /// Carries the version required by the caller.
+        expected: String,
+        /// Carries the version reported by Absurd.
+        actual: Option<String>,
+    },
     /// Indicates that PostgreSQL returned an error.
     #[error("postgres error")]
     Sqlx {

@@ -56,7 +56,7 @@
             version = cargoToml.package.version;
             description = cargoToml.package.description;
             nativeBuildInputs = with pkgs; [ llvmPackages.bintools ];
-            buildInputs = with pkgs; [ postgresql ];
+            nativeCheckInputs = with pkgs; [ postgresql ];
 
             src = pkgs.lib.cleanSource ./.;
 

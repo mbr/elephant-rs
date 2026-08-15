@@ -13,6 +13,7 @@ use std::{
 use room::{
     client::Client,
     error::Error,
+    schema,
     task::{Router, Task},
     types::{
         CreateQueueOptions, PgInterval, QueueDetachMode, QueuePolicyOptions, RetryStrategy,
@@ -84,6 +85,20 @@ async fn setup() -> Result<TestDb, Box<dyn StdError + Send + Sync>> {
         .create_queue("default", CreateQueueOptions::default())
         .await?;
     Ok(TestDb { _db: db, client })
+}
+
+/// Verifies that schema inspection reports the installed fixture.
+#[tokio::test]
+async fn schema_version_is_reported() -> Result<(), Box<dyn StdError + Send + Sync>> {
+    let test = setup().await?;
+
+    schema::assert_installed(test.client.pool()).await?;
+    schema::assert_version(test.client.pool(), "main").await?;
+    assert_eq!(
+        schema::version(test.client.pool()).await?,
+        Some("main".to_string())
+    );
+    Ok(())
 }
 
 /// Verifies that a typed task can be spawned and completed.
