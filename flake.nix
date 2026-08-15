@@ -27,7 +27,8 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        toolchain = fenix.packages.${system}.stable.withComponents [
+        buildToolchain = fenix.packages.${system}.stable.minimalToolchain;
+        devToolchain = fenix.packages.${system}.stable.withComponents [
           "cargo"
           "clippy"
           "rust-analyzer"
@@ -37,8 +38,8 @@
         ];
 
         platform = pkgs.makeRustPlatform {
-          cargo = toolchain;
-          rustc = toolchain;
+          cargo = buildToolchain;
+          rustc = buildToolchain;
         };
 
         cargoToml = pkgs.lib.importTOML ./Cargo.toml;
@@ -46,7 +47,10 @@
         # Fenix's lld doesn't set RPATH; use wrapped lld for native deps.
         # This flag is also needed on macOS, but gated behind -Z unstable-options there.
         rustEnv = {
-          RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-Clink-self-contained=-linker";
+          RUSTFLAGS =
+            pkgs.lib.optionalString pkgs.stdenv.isLinux "-Clink-self-contained=-linker "
+            # Avoid runtime references from embedded toolchain source paths.
+            + "--remap-path-prefix=${buildToolchain}=/rustc";
           OPENSSL_NO_VENDOR = "1";
         };
       in
@@ -74,6 +78,7 @@
           rustEnv
           // {
             inputsFrom = [ self.packages.${system}.default ];
+            packages = [ devToolchain ];
             buildInputs = [
               pgdb.packages.${system}.default
               pkgs.nixfmt
