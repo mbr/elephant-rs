@@ -8,6 +8,8 @@
     flake-utils.url = "flake-utils";
     pgdb = {
       url = "github:mbr/pgdb-rs";
+      inputs.fenix.follows = "fenix";
+      inputs.flake-utils.follows = "flake-utils";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
