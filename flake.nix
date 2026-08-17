@@ -78,7 +78,7 @@
           rustEnv
           // {
             inputsFrom = [ self.packages.${system}.default ];
-            packages = [ devToolchain ];
+            nativeBuildInputs = [ devToolchain ];
             buildInputs = [
               pgdb.packages.${system}.default
               pkgs.nixfmt
