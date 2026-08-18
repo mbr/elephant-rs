@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use room::{
+use elephant::{
     client::Client,
     error::Error,
     schema,
@@ -46,7 +46,7 @@ type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
 struct TestDb {
     /// Keeps the database fixture alive.
     _db: pgdb::DbInstance,
-    /// Holds the Room client.
+    /// Holds the Elephant client.
     client: Client,
 }
 
@@ -68,7 +68,7 @@ impl StdError for TestFailure {}
 /// # Panic
 ///
 /// Always panics.
-async fn panic_output() -> room::error::Result<Output> {
+async fn panic_output() -> elephant::error::Result<Output> {
     panic!("intentional panic")
 }
 
@@ -273,7 +273,7 @@ async fn cancellation_maps_absurd_sqlstate() -> Result<(), Box<dyn StdError + Se
         .await?;
     let mut leases = test
         .client
-        .claim_task("default", &room::worker::ClaimOptions::default())
+        .claim_task("default", &elephant::worker::ClaimOptions::default())
         .await?;
     let lease = leases.pop().expect("spawned task should be claimable");
 
@@ -299,17 +299,17 @@ async fn already_failed_run_maps_absurd_sqlstate() -> Result<(), Box<dyn StdErro
         .await?;
     let mut leases = test
         .client
-        .claim_task("default", &room::worker::ClaimOptions::default())
+        .claim_task("default", &elephant::worker::ClaimOptions::default())
         .await?;
     let lease = leases.pop().expect("spawned task should be claimable");
-    lease.fail(room::error::FailureReason::panic()).await?;
+    lease.fail(elephant::error::FailureReason::panic()).await?;
 
     let error = test
         .client
         .fail_run(
             "default",
             spawned.run_id.as_uuid(),
-            room::error::FailureReason::panic(),
+            elephant::error::FailureReason::panic(),
         )
         .await
         .expect_err("second failure should report already-failed state");
@@ -380,7 +380,7 @@ async fn synchronous_panic_becomes_failed_task_result() -> TestResult {
         .queue("default")?
         .default_max_attempts(1)
         .handler(
-            |_context, _input| -> std::future::Ready<room::error::Result<Output>> {
+            |_context, _input| -> std::future::Ready<elephant::error::Result<Output>> {
                 panic!("intentional synchronous panic")
             },
         )
@@ -562,7 +562,7 @@ async fn worker_shutdown_waits_for_in_flight_task() -> Result<(), Box<dyn StdErr
     let worker_shutdown = shutdown.clone();
     let client = test.client.clone();
     let worker = tokio::spawn(async move {
-        room::worker::run_worker(
+        elephant::worker::run_worker(
             client,
             router,
             WorkerOptions {

@@ -1,6 +1,6 @@
-# Room specification
+# Elephant specification
 
-`room` is an idiomatic Rust SDK for Absurd, a Postgres-native durable
+`elephant` is an idiomatic Rust SDK for Absurd, a Postgres-native durable
 workflow system. The crate should expose Absurd's task, run, checkpoint, sleep,
 event, retry, and cancellation model directly. It should not be a job queue
 facade and should not hide Absurd behind a framework that owns the process.
@@ -12,7 +12,7 @@ built on public primitives.
 
 ## Goals
 
-`room` should make the following simple and type-safe:
+`elephant` should make the following simple and type-safe:
 
 - spawn typed tasks onto Absurd queues;
 - claim runs and resolve them exactly once in Rust code paths;
@@ -35,18 +35,18 @@ and stable checkpoint names.
 
 ## Non-goals
 
-`room` should not manage the Absurd schema as its main responsibility. The
+`elephant` should not manage the Absurd schema as its main responsibility. The
 recommended production path is to apply `absurd.sql` and its migrations through
 the application's migration system. The crate may provide schema version checks
 and test helpers, but migrations should not be hidden in `Client::connect`.
 
-`room` should not require users to surrender their runtime to a framework. A
+`elephant` should not require users to surrender their runtime to a framework. A
 `run_worker` helper is acceptable only if the lower-level claim and dispatch
 primitives are first-class.
 
-`room` should not re-export everything from the crate root. Public items should
-live at canonical module paths such as `room::client::Client` and
-`room::task::Task`.
+`elephant` should not re-export everything from the crate root. Public items should
+live at canonical module paths such as `elephant::client::Client` and
+`elephant::task::Task`.
 
 ## Architecture
 
@@ -64,12 +64,12 @@ The primitive type is a claimed run, not a worker. A worker is just a loop that
 claims runs and dispatches them through a router.
 
 ```rust
-let router = room::task::Router::new()
+let router = elephant::task::Router::new()
     .task(provision_user)
     .task(send_email);
 
 client
-    .claims("default", room::worker::ClaimOptions::default())
+    .claims("default", elephant::worker::ClaimOptions::default())
     .try_for_each_concurrent(8, |run| router.dispatch(run))
     .await?;
 ```
@@ -310,7 +310,7 @@ behavior; if provided, it must be explicit in `WorkerOptions`.
 Task definition:
 
 ```rust
-let provision_user = room::task::Task::builder("provision-user")
+let provision_user = elephant::task::Task::builder("provision-user")
     .queue("default")
     .default_max_attempts(5)
     .handler(|ctx, params: ProvisionUserParams| async move {
@@ -333,12 +333,12 @@ let provision_user = room::task::Task::builder("provision-user")
 Client and router:
 
 ```rust
-let client = room::client::Client::builder(pool)
+let client = elephant::client::Client::builder(pool)
     .default_queue("default")
     .default_max_attempts(5)
     .build()?;
 
-let router = room::task::Router::new().task(provision_user)?;
+let router = elephant::task::Router::new().task(provision_user)?;
 ```
 
 Spawn:
@@ -357,7 +357,7 @@ Manual loop:
 
 ```rust
 client
-    .claims("default", room::worker::ClaimOptions::default())
+    .claims("default", elephant::worker::ClaimOptions::default())
     .try_for_each_concurrent(8, |run| router.dispatch(run))
     .await?;
 ```

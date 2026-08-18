@@ -32,7 +32,7 @@ impl Default for ClaimOptions {
     /// Creates default claim options.
     fn default() -> Self {
         Self {
-            worker_id: "room-worker".to_string(),
+            worker_id: "elephant-worker".to_string(),
             claim_timeout: Duration::from_secs(30),
             batch_size: 1,
             empty_poll_delay: Duration::from_millis(250),

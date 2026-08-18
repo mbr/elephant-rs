@@ -314,7 +314,7 @@ fn failure_reason(error: &Error) -> FailureReason {
         }
         Error::HandlerPanicked => FailureReason::panic(),
         _ => FailureReason::from_error_named(
-            "room_error",
+            "elephant_error",
             error as &(dyn error::Error + Send + Sync),
         ),
     }

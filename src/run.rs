@@ -156,14 +156,14 @@ fn is_resolved_outcome(outcome: &Result<()>) -> bool {
     )
 }
 
-/// Converts a room error into a stable failure reason.
+/// Converts an Elephant error into a stable failure reason.
 fn failure_reason(error: &Error) -> FailureReason {
     match error {
         Error::Handler { source } => {
             FailureReason::from_error_named("handler_error", source.as_ref())
         }
         Error::HandlerPanicked => FailureReason::panic(),
-        _ => FailureReason::from_error_named("room_error", error),
+        _ => FailureReason::from_error_named("elephant_error", error),
     }
 }
 

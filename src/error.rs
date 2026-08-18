@@ -1,4 +1,4 @@
-//! Error types for Room.
+//! Error types for Elephant.
 
 use std::{error, fmt, num::TryFromIntError};
 
@@ -10,7 +10,7 @@ use thiserror::Error;
 /// Represents the crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Represents errors returned by Room operations.
+/// Represents errors returned by Elephant operations.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Indicates that Absurd cancelled the task.
@@ -152,28 +152,28 @@ impl Error {
 }
 
 impl From<SqlxError> for Error {
-    /// Converts SQLx errors into Room errors.
+    /// Converts SQLx errors into Elephant errors.
     fn from(source: SqlxError) -> Self {
         Self::from_sqlx(source)
     }
 }
 
 impl From<JsonError> for Error {
-    /// Converts JSON errors into Room errors.
+    /// Converts JSON errors into Elephant errors.
     fn from(source: JsonError) -> Self {
         Self::json(source)
     }
 }
 
 impl From<TryFromIntError> for Error {
-    /// Converts integer conversion errors into Room errors.
+    /// Converts integer conversion errors into Elephant errors.
     fn from(source: TryFromIntError) -> Self {
         Self::duration_out_of_range(source)
     }
 }
 
 impl From<JiffError> for Error {
-    /// Converts time errors into Room errors.
+    /// Converts time errors into Elephant errors.
     fn from(source: JiffError) -> Self {
         Self::jiff(source)
     }

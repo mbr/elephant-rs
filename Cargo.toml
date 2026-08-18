@@ -1,11 +1,11 @@
 [package]
-name = "room"
+name = "elephant"
 description = "Rust SDK for Absurd durable workflows"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mbr/room-rs"
-documentation = "https://docs.rs/room"
+repository = "https://github.com/mbr/elephant-rs"
+documentation = "https://docs.rs/elephant"
 readme = "README.md"
 keywords = ["postgres", "workflow", "queue", "durable"]
 categories = ["asynchronous", "database"]

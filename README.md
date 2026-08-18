@@ -1,6 +1,6 @@
-# room
+# elephant
 
-`room` is a Rust SDK for Absurd durable workflows on PostgreSQL.
+`elephant` is a Rust SDK for Absurd durable workflows on PostgreSQL.
 
 The library exposes Absurd's native model: tasks, runs, checkpoints, sleeps,
 events, retries, cancellation, and queue operations. Workers are convenience
@@ -19,7 +19,7 @@ schema migrations.
 ## Typed tasks
 
 ```rust,no_run
-use room::{client::Client, task::{Router, Task}, types::CreateQueueOptions};
+use elephant::{client::Client, task::{Router, Task}, types::CreateQueueOptions};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -33,7 +33,7 @@ struct Output {
     value: i32,
 }
 
-# async fn example(pool: PgPool) -> room::error::Result<()> {
+# async fn example(pool: PgPool) -> elephant::error::Result<()> {
 let mut builder = Client::builder(pool);
 builder.default_queue("default")?;
 let client = builder.build();
@@ -59,9 +59,9 @@ let spawned = client.spawn(&task, Params { value: 21 }).send().await?;
 
 ```rust,no_run
 use futures::StreamExt;
-use room::{client::Client, task::Router, worker::ClaimOptions};
+use elephant::{client::Client, task::Router, worker::ClaimOptions};
 
-# async fn example(client: Client, router: Router) -> room::error::Result<()> {
+# async fn example(client: Client, router: Router) -> elephant::error::Result<()> {
 let mut claims = client.claims("default", ClaimOptions::default());
 while let Some(lease) = claims.next().await {
     router.dispatch(lease?).await?;
@@ -73,10 +73,10 @@ while let Some(lease) = claims.next().await {
 ## Convenience worker
 
 ```rust,no_run
-use room::{client::Client, task::Router};
+use elephant::{client::Client, task::Router};
 use tokio_util::sync::CancellationToken;
 
-# async fn example(client: Client, router: Router) -> room::error::Result<()> {
+# async fn example(client: Client, router: Router) -> elephant::error::Result<()> {
 let shutdown = CancellationToken::new();
 client.worker(router).concurrency(8).run(shutdown).await?;
 # Ok(())
@@ -101,6 +101,6 @@ can deadlock a worker pool. Cross-queue waits are available through
 
 ## SQLx policy
 
-Most Absurd calls target stored procedures and dynamic queue tables. `room` keeps
+Most Absurd calls target stored procedures and dynamic queue tables. `elephant` keeps
 runtime-checked `sqlx` queries small, maps rows into typed structs immediately,
 and covers those calls with `pgdb` integration tests against real PostgreSQL.

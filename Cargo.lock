@@ -245,6 +245,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "elephant"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "jiff",
+ "pgdb",
+ "pin-project-lite",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1157,25 +1176,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "room"
-version = "0.1.0"
-dependencies = [
- "futures",
- "jiff",
- "pgdb",
- "pin-project-lite",
- "rand 0.9.4",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
 ]
 
 [[package]]
