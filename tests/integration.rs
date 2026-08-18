@@ -46,10 +46,10 @@ type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
 
 /// Owns an ephemeral test database.
 struct TestDb {
-    /// Keeps the database fixture alive.
-    _db: pgdb::DbInstance,
     /// Holds the Elephant client.
     client: Client,
+    /// Keeps the database fixture alive until after the client is dropped.
+    _db: pgdb::DbInstance,
 }
 
 /// Represents an intentional task failure.
@@ -96,7 +96,7 @@ async fn setup_with_max_connections(
     client
         .create_queue("default", CreateQueueOptions::default())
         .await?;
-    Ok(TestDb { _db: db, client })
+    Ok(TestDb { client, _db: db })
 }
 
 /// Verifies that schema inspection reports the installed fixture.
