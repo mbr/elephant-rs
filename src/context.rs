@@ -92,20 +92,18 @@ impl TaskContext {
             return serde_json::from_value(value).map_err(Error::json);
         }
         let value = run().await?;
+        let payload = serde_json::to_value(&value).map_err(Error::json)?;
         self.client
             .set_checkpoint(
                 self.metadata.queue_name.as_str(),
                 self.metadata.task_id.as_uuid(),
                 step_name.as_str(),
-                &value,
+                &payload,
                 self.metadata.run_id.as_uuid(),
                 self.checkpoint_extend_by,
             )
             .await?;
-        self.insert_checkpoint(
-            step_name.as_str(),
-            serde_json::to_value(&value).map_err(Error::json)?,
-        );
+        self.insert_checkpoint(step_name.as_str(), payload);
         Ok(value)
     }
 
@@ -300,20 +298,18 @@ impl TaskContext {
     /// Persists a durable sleep checkpoint.
     async fn persist_sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<()> {
         let checkpoint = SleepCheckpoint { wake_at };
+        let payload = serde_json::to_value(checkpoint).map_err(Error::json)?;
         self.client
             .set_checkpoint(
                 self.metadata.queue_name.as_str(),
                 self.metadata.task_id.as_uuid(),
                 step_name,
-                &checkpoint,
+                &payload,
                 self.metadata.run_id.as_uuid(),
                 self.checkpoint_extend_by,
             )
             .await?;
-        self.insert_checkpoint(
-            step_name,
-            serde_json::to_value(&checkpoint).map_err(Error::json)?,
-        );
+        self.insert_checkpoint(step_name, payload);
         Ok(())
     }
 
@@ -408,21 +404,20 @@ where
 {
     /// Completes a pending step with a value.
     pub async fn complete(self, value: T) -> Result<T> {
+        let payload = serde_json::to_value(&value).map_err(Error::json)?;
         self.context
             .client
             .set_checkpoint(
                 self.context.metadata.queue_name.as_str(),
                 self.context.metadata.task_id.as_uuid(),
                 self.step_name.as_str(),
-                &value,
+                &payload,
                 self.context.metadata.run_id.as_uuid(),
                 self.context.checkpoint_extend_by,
             )
             .await?;
-        self.context.insert_checkpoint(
-            self.step_name.as_str(),
-            serde_json::to_value(&value).map_err(Error::json)?,
-        );
+        self.context
+            .insert_checkpoint(self.step_name.as_str(), payload);
         Ok(value)
     }
 }
