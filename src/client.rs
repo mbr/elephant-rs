@@ -102,10 +102,10 @@ impl Client {
         queue_name: impl AsRef<str>,
         options: QueuePolicyOptions,
     ) -> Result<()> {
+        let queue_name = QueueName::from_str(queue_name.as_ref())?;
         if options.is_empty() {
             return Ok(());
         }
-        let queue_name = QueueName::from_str(queue_name.as_ref())?;
         let payload = serde_json::to_value(options).map_err(Error::json)?;
         sqlx::query("SELECT absurd.set_queue_policy($1, $2::jsonb)")
             .bind(queue_name.as_str())
@@ -338,6 +338,15 @@ impl Client {
         Ok(())
     }
 
+    /// Returns Absurd's current database time.
+    pub(crate) async fn current_time(&self) -> Result<Timestamp> {
+        let value: String = sqlx::query_scalar("SELECT absurd.current_time()::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Error::from_sqlx)?;
+        value.parse().map_err(Error::jiff)
+    }
+
     /// Schedules a running run after a database-relative delay.
     pub(crate) async fn schedule_run_after(
         &self,
@@ -556,15 +565,24 @@ impl Client {
         let started = std::time::Instant::now();
         let mut delay = Duration::from_millis(50);
         loop {
-            if let Some(snapshot) = self.fetch_task_result(queue_name.as_str(), task_id).await?
-                && snapshot.is_terminal()
-            {
+            let snapshot = self
+                .fetch_task_result(queue_name.as_str(), task_id)
+                .await?
+                .ok_or(Error::TaskNotFound { task_id })?;
+            if snapshot.is_terminal() {
                 return Ok(snapshot);
             }
-            if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-                return Err(Error::TaskResultTimeout { task_id });
-            }
-            sleep(delay).await;
+            let sleep_for = match timeout {
+                Some(timeout) => {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(Error::TaskResultTimeout { task_id });
+                    }
+                    delay.min(remaining)
+                }
+                None => delay,
+            };
+            sleep(sleep_for).await;
             delay = (delay * 2).min(Duration::from_secs(1));
         }
     }
@@ -731,7 +749,17 @@ where
 {
     /// Sets the target queue.
     pub fn queue(mut self, queue_name: impl AsRef<str>) -> Result<Self> {
-        self.queue_name = Some(QueueName::from_str(queue_name.as_ref())?);
+        let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        if let Some(expected) = &self.queue_name
+            && expected != &queue_name
+        {
+            return Err(Error::TaskQueueMismatch {
+                task_name: self.task_name.to_string(),
+                expected: expected.to_string(),
+                actual: queue_name.to_string(),
+            });
+        }
+        self.queue_name = Some(queue_name);
         Ok(self)
     }
 
@@ -859,6 +887,8 @@ fn row_to_spawn_result(row: sqlx::postgres::PgRow) -> Result<SpawnResult> {
 
 /// Converts a duration to Absurd seconds.
 fn seconds_i32(duration: Duration) -> Result<i32> {
-    let seconds = duration.as_secs() + u64::from(duration.subsec_nanos() > 0);
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0));
     i32::try_from(seconds).map_err(Error::duration_out_of_range)
 }

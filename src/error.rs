@@ -94,6 +94,12 @@ pub enum Error {
     /// Indicates that a task run suspended itself.
     #[error("task run suspended")]
     Suspended,
+    /// Indicates that a task does not exist in the selected queue.
+    #[error("task {task_id} was not found")]
+    TaskNotFound {
+        /// Identifies the missing task.
+        task_id: uuid::Uuid,
+    },
     /// Indicates that a task finished without a decodable result.
     #[error("task {task_id} completed without a result")]
     TaskResultMissing {
@@ -113,6 +119,16 @@ pub enum Error {
     TaskResultTimeout {
         /// Identifies the task whose result was awaited.
         task_id: uuid::Uuid,
+    },
+    /// Indicates that a spawn queue conflicts with its task definition.
+    #[error("task {task_name:?} uses queue {expected:?}, not {actual:?}")]
+    TaskQueueMismatch {
+        /// Names the task being spawned.
+        task_name: String,
+        /// Names the queue configured on the task.
+        expected: String,
+        /// Names the conflicting requested queue.
+        actual: String,
     },
     /// Indicates that a task is unknown to the local router.
     #[error("unknown task {task_name}")]

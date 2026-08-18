@@ -143,19 +143,7 @@ impl TaskContext {
     ) -> Result<()> {
         let step_name = step_name.as_ref().parse::<StepName>()?;
         let wake_at = self.sleep_checkpoint(step_name.as_str(), wake_at).await?;
-        let now = Timestamp::now();
-        if now >= wake_at {
-            return Ok(());
-        }
-        let delay = Duration::try_from(wake_at.duration_since(now)).map_err(Error::jiff)?;
-        self.client
-            .schedule_run_after(
-                self.metadata.queue_name.as_str(),
-                self.metadata.run_id.as_uuid(),
-                delay,
-            )
-            .await?;
-        Err(Error::Suspended)
+        self.suspend_until(wake_at).await
     }
 
     /// Schedules the active run to resume after a duration.
@@ -169,8 +157,21 @@ impl TaskContext {
         step_name: impl AsRef<str>,
         duration: Duration,
     ) -> Result<()> {
-        let wake_at = Timestamp::now().saturating_add(duration)?;
-        self.sleep_until_named(step_name, wake_at).await
+        let step_name = step_name.as_ref().parse::<StepName>()?;
+        let wake_at = match self.checkpoint_value(step_name.as_str())? {
+            Some(value) => {
+                let checkpoint: SleepCheckpoint =
+                    serde_json::from_value(value).map_err(Error::json)?;
+                checkpoint.wake_at
+            }
+            None => {
+                let wake_at = self.client.current_time().await?.saturating_add(duration)?;
+                self.persist_sleep_checkpoint(step_name.as_str(), wake_at)
+                    .await?;
+                wake_at
+            }
+        };
+        self.suspend_until(wake_at).await
     }
 
     /// Awaits an event or suspends the active run.
@@ -292,6 +293,12 @@ impl TaskContext {
             let checkpoint: SleepCheckpoint = serde_json::from_value(value).map_err(Error::json)?;
             return Ok(checkpoint.wake_at);
         }
+        self.persist_sleep_checkpoint(step_name, wake_at).await?;
+        Ok(wake_at)
+    }
+
+    /// Persists a durable sleep checkpoint.
+    async fn persist_sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<()> {
         let checkpoint = SleepCheckpoint { wake_at };
         self.client
             .set_checkpoint(
@@ -306,8 +313,22 @@ impl TaskContext {
         self.insert_checkpoint(
             step_name,
             serde_json::to_value(&checkpoint).map_err(Error::json)?,
-        )?;
-        Ok(wake_at)
+        )
+    }
+
+    /// Suspends the active run until a database timestamp.
+    async fn suspend_until(&self, wake_at: Timestamp) -> Result<()> {
+        if self.client.current_time().await? >= wake_at {
+            return Ok(());
+        }
+        self.client
+            .schedule_run(
+                self.metadata.queue_name.as_str(),
+                self.metadata.run_id.as_uuid(),
+                wake_at,
+            )
+            .await?;
+        Err(Error::Suspended)
     }
 
     /// Fetches a cached checkpoint payload.

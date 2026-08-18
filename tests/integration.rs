@@ -122,6 +122,12 @@ async fn spawned_task_completes_through_router() -> Result<(), Box<dyn StdError 
         .handler(|_context, input| async move { Ok(Output { value: input.value }) })
         .build();
     let router = Router::new().task(task.clone())?;
+    let mismatch = test
+        .client
+        .spawn(&task, Input { value: 0 })
+        .queue("other")
+        .expect_err("task queue overrides should not conflict");
+    assert!(matches!(mismatch, Error::TaskQueueMismatch { .. }));
 
     let spawned = test.client.spawn(&task, Input { value: 42 }).send().await?;
     work_batch(&test.client, &router, "default").await?;
@@ -283,8 +289,19 @@ async fn sleep_schedules_relative_to_database_clock() -> TestResult {
     let delay = available_at.duration_since(database_now).as_secs_f64();
 
     assert!((9.0..=11.0).contains(&delay));
+
+    let after_wakeup = database_now.saturating_add(Duration::from_secs(11))?;
+    sqlx::query("SELECT set_config('absurd.fake_now', $1, false)")
+        .bind(after_wakeup.to_string())
+        .execute(test.client.pool())
+        .await?;
     work_batch(&test.client, &router, "default").await?;
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let result = spawned
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await?;
+
+    assert_eq!(result, Output { value: 1 });
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
     Ok(())
 }
 
