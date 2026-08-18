@@ -348,7 +348,7 @@ impl PgInterval {
 impl From<Duration> for PgInterval {
     /// Creates an interval from a duration.
     fn from(value: Duration) -> Self {
-        Self(format!("{} seconds", value.as_secs()))
+        Self(format!("{} seconds", value.as_secs_f64()))
     }
 }
 
@@ -522,13 +522,13 @@ impl CancellationPolicy {
         if let Some(max_duration) = self.max_duration {
             value.insert(
                 "max_duration".to_string(),
-                serde_json::json!(max_duration.as_secs()),
+                serde_json::json!(whole_seconds_ceil(max_duration)),
             );
         }
         if let Some(max_delay) = self.max_delay {
             value.insert(
                 "max_delay".to_string(),
-                serde_json::json!(max_delay.as_secs()),
+                serde_json::json!(whole_seconds_ceil(max_delay)),
             );
         }
         Value::Object(value)
@@ -755,6 +755,13 @@ impl RetryTaskOptions {
     }
 }
 
+/// Converts a duration to whole seconds without truncating nonzero fractions.
+fn whole_seconds_ceil(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+}
+
 /// Validates a named string.
 fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> Result<String> {
     if value.trim().is_empty() {
@@ -780,7 +787,10 @@ fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> 
 mod tests {
     use std::time::Duration;
 
-    use crate::types::{MAX_QUEUE_NAME_BYTES, QueueName, RetryStrategy, SpawnOptions, TaskName};
+    use crate::types::{
+        CancellationPolicy, MAX_QUEUE_NAME_BYTES, PgInterval, QueueName, RetryStrategy,
+        SpawnOptions, TaskName,
+    };
 
     #[test]
     fn names_validate_basic_constraints() {
@@ -814,5 +824,15 @@ mod tests {
         assert_eq!(retry.to_json()["kind"], "exponential");
         assert_eq!(retry.to_json()["max_seconds"], 60.0);
         assert_eq!(options.to_json(Some(5))["max_attempts"], 1);
+
+        let cancellation = CancellationPolicy {
+            max_duration: Some(Duration::from_millis(1)),
+            max_delay: None,
+        };
+        assert_eq!(cancellation.to_json()["max_duration"], 1);
+        assert_eq!(
+            PgInterval::from(Duration::from_millis(500)).as_str(),
+            "0.5 seconds"
+        );
     }
 }

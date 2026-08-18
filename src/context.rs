@@ -88,7 +88,7 @@ impl TaskContext {
         Fun: FnOnce() -> Fut,
     {
         let step_name = step_name.as_ref().parse::<StepName>()?;
-        if let Some(value) = self.checkpoint_value(step_name.as_str())? {
+        if let Some(value) = self.checkpoint_value(step_name.as_str()) {
             return serde_json::from_value(value).map_err(Error::json);
         }
         let value = run().await?;
@@ -105,7 +105,7 @@ impl TaskContext {
         self.insert_checkpoint(
             step_name.as_str(),
             serde_json::to_value(&value).map_err(Error::json)?,
-        )?;
+        );
         Ok(value)
     }
 
@@ -115,7 +115,7 @@ impl TaskContext {
         T: DeserializeOwned + Serialize,
     {
         let step_name = step_name.as_ref().parse::<StepName>()?;
-        if let Some(value) = self.checkpoint_value(step_name.as_str())? {
+        if let Some(value) = self.checkpoint_value(step_name.as_str()) {
             let value = serde_json::from_value(value).map_err(Error::json)?;
             Ok(Step::Done(DoneStep {
                 value,
@@ -158,7 +158,7 @@ impl TaskContext {
         duration: Duration,
     ) -> Result<()> {
         let step_name = step_name.as_ref().parse::<StepName>()?;
-        let wake_at = match self.checkpoint_value(step_name.as_str())? {
+        let wake_at = match self.checkpoint_value(step_name.as_str()) {
             Some(value) => {
                 let checkpoint: SleepCheckpoint =
                     serde_json::from_value(value).map_err(Error::json)?;
@@ -289,7 +289,7 @@ impl TaskContext {
 
     /// Creates or reads a durable sleep checkpoint.
     async fn sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<Timestamp> {
-        if let Some(value) = self.checkpoint_value(step_name)? {
+        if let Some(value) = self.checkpoint_value(step_name) {
             let checkpoint: SleepCheckpoint = serde_json::from_value(value).map_err(Error::json)?;
             return Ok(checkpoint.wake_at);
         }
@@ -313,7 +313,8 @@ impl TaskContext {
         self.insert_checkpoint(
             step_name,
             serde_json::to_value(&checkpoint).map_err(Error::json)?,
-        )
+        );
+        Ok(())
     }
 
     /// Suspends the active run until a database timestamp.
@@ -332,22 +333,21 @@ impl TaskContext {
     }
 
     /// Fetches a cached checkpoint payload.
-    fn checkpoint_value(&self, step_name: &str) -> Result<Option<Value>> {
+    fn checkpoint_value(&self, step_name: &str) -> Option<Value> {
         let guard = self
             .checkpoints
             .lock()
             .expect("checkpoint cache lock poisoned");
-        Ok(guard.get(step_name).cloned())
+        guard.get(step_name).cloned()
     }
 
     /// Inserts a cached checkpoint payload.
-    fn insert_checkpoint(&self, step_name: &str, value: Value) -> Result<()> {
+    fn insert_checkpoint(&self, step_name: &str, value: Value) {
         let mut guard = self
             .checkpoints
             .lock()
             .expect("checkpoint cache lock poisoned");
         guard.insert(step_name.to_string(), value);
-        Ok(())
     }
 }
 
@@ -422,7 +422,7 @@ where
         self.context.insert_checkpoint(
             self.step_name.as_str(),
             serde_json::to_value(&value).map_err(Error::json)?,
-        )?;
+        );
         Ok(value)
     }
 }
