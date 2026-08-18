@@ -224,10 +224,18 @@ pub async fn work_batch(
         let router = router.clone();
         futures.push(async move { router.dispatch(lease).await }.boxed());
     }
+    let mut first_error = None;
     while let Some(result) = futures.next().await {
-        result?;
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Runs a convenience worker loop.
@@ -247,7 +255,10 @@ pub async fn run_worker(
                     let Some(lease) = item else {
                         break;
                     };
-                    let lease = lease?;
+                    let lease = match lease {
+                        Ok(lease) => lease,
+                        Err(error) => return drain_after_error(in_flight, error).await,
+                    };
                     let router = router.clone();
                     let watchdog = options.lease_watchdog.clone();
                     in_flight.push(
@@ -263,12 +274,25 @@ pub async fn run_worker(
         tokio::select! {
             _ = shutdown.cancelled(), if in_flight.is_empty() => return Ok(()),
             result = in_flight.next(), if !in_flight.is_empty() => {
-                if let Some(result) = result {
-                    result?;
+                if let Some(Err(error)) = result {
+                    return drain_after_error(in_flight, error).await;
                 }
             }
         }
     }
+}
+
+/// Drains active dispatches before returning the first worker error.
+async fn drain_after_error(
+    mut in_flight: FuturesUnordered<BoxFuture<'static, Result<()>>>,
+    first_error: Error,
+) -> Result<()> {
+    while let Some(result) = in_flight.next().await {
+        if let Err(error) = result {
+            warn!(error = %error, "task dispatch failed during worker shutdown");
+        }
+    }
+    Err(first_error)
 }
 
 /// Dispatches a run while extending its claim.
@@ -283,12 +307,16 @@ async fn dispatch_with_watchdog(
     let metadata = LeaseMetadata::from_run(lease.claimed_run());
     let client = lease.client().clone();
     let shutdown = CancellationToken::new();
-    let watchdog = tokio::spawn(watch_lease(client, metadata, options, shutdown.clone()));
-    let result = router.dispatch(lease).await;
-    shutdown.cancel();
-    if let Err(error) = watchdog.await {
-        warn!(error = %error, "lease watchdog task failed");
-    }
+    let watchdog_shutdown = shutdown.clone();
+    let dispatch = async {
+        let result = router.dispatch(lease).await;
+        shutdown.cancel();
+        result
+    };
+    let (result, ()) = tokio::join!(
+        dispatch,
+        watch_lease(client, metadata, options, watchdog_shutdown)
+    );
     result
 }
 
@@ -301,8 +329,12 @@ async fn watch_lease(
 ) {
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => return,
             () = sleep(options.interval) => {}
+        }
+        if shutdown.is_cancelled() {
+            return;
         }
         match client
             .extend_claim(

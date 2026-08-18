@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    error,
     future::Future,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -17,7 +16,7 @@ use serde_json::Value;
 
 use crate::{
     context::TaskContext,
-    error::{Error, FailureReason, Result},
+    error::{Error, Result},
     run::RunLease,
     types::{CancellationPolicy, QueueName, TaskName},
 };
@@ -235,17 +234,7 @@ impl Router {
             .into_iter()
             .collect();
         let context = TaskContext::new(client, &run, checkpoints);
-        match task.handle(context, run.params).await {
-            Ok(result) => complete_lease(lease, result).await,
-            Err(Error::Suspended | Error::Cancelled | Error::RunAlreadyFailed) => {
-                lease.forget();
-                Ok(())
-            }
-            Err(error) => {
-                let reason = failure_reason(&error);
-                fail_lease(lease, reason).await
-            }
-        }
+        lease.run(task.handle(context, run.params)).await
     }
 
     /// Defers a run with an unknown task name.
@@ -279,22 +268,6 @@ impl ErasedTask {
     }
 }
 
-/// Completes a lease while treating terminal races as control flow.
-async fn complete_lease(lease: RunLease, result: Value) -> Result<()> {
-    match lease.complete(result).await {
-        Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Fails a lease while treating terminal races as control flow.
-async fn fail_lease(lease: RunLease, reason: FailureReason) -> Result<()> {
-    match lease.fail(reason).await {
-        Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
 /// Returns a jitter duration up to the provided maximum.
 fn jitter_duration(maximum: Duration) -> Duration {
     let millis = maximum.as_millis();
@@ -303,18 +276,4 @@ fn jitter_duration(maximum: Duration) -> Duration {
     }
     let upper = u64::try_from(millis).unwrap_or(u64::MAX);
     Duration::from_millis(rand::rng().random_range(0..=upper))
-}
-
-/// Converts a handler error into an Absurd failure payload.
-fn failure_reason(error: &Error) -> FailureReason {
-    match error {
-        Error::Handler { source } => {
-            FailureReason::from_error_named("handler_error", source.as_ref())
-        }
-        Error::HandlerPanicked => FailureReason::panic(),
-        _ => FailureReason::from_error_named(
-            "elephant_error",
-            error as &(dyn error::Error + Send + Sync),
-        ),
-    }
 }

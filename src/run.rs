@@ -104,17 +104,18 @@ impl RunLease {
         T: Serialize,
         Fut: Future<Output = Result<T>>,
     {
-        match future.await {
+        let outcome = match future.await {
             Ok(result) => self.complete(result).await,
             Err(Error::Suspended | Error::Cancelled | Error::RunAlreadyFailed) => {
                 self.forget();
-                Ok(())
+                return Ok(());
             }
             Err(error) => {
                 let reason = failure_reason(&error);
                 self.fail(reason).await
             }
-        }
+        };
+        ignore_terminal_error(outcome)
     }
 
     /// Schedules the run to wake at an absolute timestamp.
@@ -162,6 +163,14 @@ fn is_resolved_outcome(outcome: &Result<()>) -> bool {
         outcome,
         Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed)
     )
+}
+
+/// Treats distributed terminal-state races as successful local resolution.
+fn ignore_terminal_error(outcome: Result<()>) -> Result<()> {
+    match outcome {
+        Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Converts an Elephant error into a stable failure reason.
