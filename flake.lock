@@ -64,11 +64,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1779986213,
-        "narHash": "sha256-pDKsyxjSBae+dN4lVo9YmWq8cjB5NbSM2MR8F2DuysE=",
+        "lastModified": 1787095520,
+        "narHash": "sha256-3HrfPnBguNgLUEBe7hH7E/g++S9kFa0y1fmE12Y3jHM=",
         "owner": "mbr",
         "repo": "pgdb-rs",
-        "rev": "4484e71c02da205bd07f6bdff7e7e20cbf691090",
+        "rev": "4712a52b5b2fcf0ccb8a5c973605cb561d5163a6",
         "type": "github"
       },
       "original": {
