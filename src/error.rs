@@ -36,6 +36,13 @@ pub enum Error {
     /// Indicates that a task handler panicked.
     #[error("handler panicked")]
     HandlerPanicked,
+    /// Indicates that a retry strategy is invalid.
+    #[error("invalid retry strategy")]
+    InvalidRetryStrategy {
+        /// Carries the PostgreSQL failure.
+        #[source]
+        source: SqlxError,
+    },
     /// Indicates that a configured name is invalid.
     #[error("invalid {kind} name {value:?}: {reason}")]
     InvalidName {
@@ -123,16 +130,16 @@ impl Error {
 
     /// Maps database-specific Absurd states to typed errors.
     pub fn from_sqlx(source: SqlxError) -> Self {
-        if let SqlxError::Database(database) = &source
-            && let Some(code) = database.code()
-        {
-            match code.as_ref() {
-                "AB001" => return Self::Cancelled,
-                "AB002" => return Self::RunAlreadyFailed,
-                _ => {}
-            }
+        let code = match &source {
+            SqlxError::Database(database) => database.code().map(|code| code.into_owned()),
+            _ => None,
+        };
+        match code.as_deref() {
+            Some("AB001") => Self::Cancelled,
+            Some("AB002") => Self::RunAlreadyFailed,
+            Some("AB003") => Self::InvalidRetryStrategy { source },
+            _ => Self::Sqlx { source },
         }
-        Self::Sqlx { source }
     }
 
     /// Creates a duration conversion error.

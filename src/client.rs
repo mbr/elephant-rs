@@ -338,6 +338,28 @@ impl Client {
         Ok(())
     }
 
+    /// Schedules a running run after a database-relative delay.
+    pub(crate) async fn schedule_run_after(
+        &self,
+        queue_name: impl AsRef<str>,
+        run_id: Uuid,
+        delay: Duration,
+    ) -> Result<()> {
+        let queue_name = QueueName::from_str(queue_name.as_ref())?;
+        sqlx::query(
+            "SELECT absurd.schedule_run(\
+             $1, $2, absurd.current_time() + make_interval(secs => $3::double precision)\
+             )",
+        )
+        .bind(queue_name.as_str())
+        .bind(run_id)
+        .bind(delay.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .map_err(Error::from_sqlx)?;
+        Ok(())
+    }
+
     /// Writes a task checkpoint.
     pub async fn set_checkpoint<T: Serialize>(
         &self,

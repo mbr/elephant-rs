@@ -21,8 +21,10 @@ use elephant::{
     },
     worker::{LeaseWatchdogOptions, WorkerOptions, work_batch},
 };
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use sqlx::{Executor, PgPool};
+use sqlx::{Executor, postgres::PgPoolOptions};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// Represents test task input.
@@ -74,8 +76,18 @@ async fn panic_output() -> elephant::error::Result<Output> {
 
 /// Creates a test database with Absurd installed.
 async fn setup() -> Result<TestDb, Box<dyn StdError + Send + Sync>> {
+    setup_with_max_connections(10).await
+}
+
+/// Creates a test database with a bounded connection pool.
+async fn setup_with_max_connections(
+    max_connections: u32,
+) -> Result<TestDb, Box<dyn StdError + Send + Sync>> {
     let db = pgdb::db_fixture();
-    let pool = PgPool::connect(db.as_str()).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(db.as_str())
+        .await?;
     pool.execute(sqlx::raw_sql(include_str!("../testdata/absurd.sql")))
         .await?;
     let mut builder = Client::builder(pool);
@@ -93,10 +105,10 @@ async fn schema_version_is_reported() -> Result<(), Box<dyn StdError + Send + Sy
     let test = setup().await?;
 
     schema::assert_installed(test.client.pool()).await?;
-    schema::assert_version(test.client.pool(), "main").await?;
+    schema::assert_version(test.client.pool(), "0.5.0").await?;
     assert_eq!(
         schema::version(test.client.pool()).await?,
-        Some("main".to_string())
+        Some("0.5.0".to_string())
     );
     Ok(())
 }
@@ -231,6 +243,48 @@ async fn sleep_replays_after_wakeup() -> Result<(), Box<dyn StdError + Send + Sy
 
     assert_eq!(result, Output { value: 5 });
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+/// Verifies that sleeps use the database clock for scheduling.
+#[tokio::test]
+async fn sleep_schedules_relative_to_database_clock() -> TestResult {
+    let test = setup_with_max_connections(1).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let task_attempts = Arc::clone(&attempts);
+    let task = Task::<Input, Output>::builder("database-clock-sleep")?
+        .queue("default")?
+        .handler(move |context, _input| {
+            let attempts = Arc::clone(&task_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                context
+                    .sleep_for_named("wait", Duration::from_secs(10))
+                    .await?;
+                Ok(Output { value: 1 })
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let database_now = Timestamp::now().saturating_add(Duration::from_secs(60))?;
+    sqlx::query("SELECT set_config('absurd.fake_now', $1, false)")
+        .bind(database_now.to_string())
+        .execute(test.client.pool())
+        .await?;
+
+    let spawned = test.client.spawn(&task, Input { value: 0 }).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    let available_at: String =
+        sqlx::query_scalar("SELECT available_at::text FROM absurd.r_default WHERE run_id = $1")
+            .bind(spawned.result.run_id.as_uuid())
+            .fetch_one(test.client.pool())
+            .await?;
+    let available_at = available_at.parse::<Timestamp>()?;
+    let delay = available_at.duration_since(database_now).as_secs_f64();
+
+    assert!((9.0..=11.0).contains(&delay));
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -442,6 +496,27 @@ async fn retry_strategy_runs_later_attempt() -> Result<(), Box<dyn StdError + Se
     Ok(())
 }
 
+/// Verifies that Absurd rejects retry delays beyond its global limit.
+#[tokio::test]
+async fn invalid_retry_strategy_maps_absurd_sqlstate() -> TestResult {
+    let test = setup().await?;
+    let options = SpawnOptions {
+        retry_strategy: Some(RetryStrategy::Fixed {
+            base: Duration::from_secs(86_401),
+        }),
+        ..SpawnOptions::default()
+    };
+
+    let error = test
+        .client
+        .spawn_untyped("invalid-retry", Input { value: 0 }, options)
+        .await
+        .expect_err("retry delays beyond one day should fail");
+
+    assert!(matches!(error, Error::InvalidRetryStrategy { .. }));
+    Ok(())
+}
+
 /// Verifies queue policy values round-trip through Absurd.
 #[tokio::test]
 async fn queue_policy_round_trips() -> Result<(), Box<dyn StdError + Send + Sync>> {
@@ -549,11 +624,17 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
 #[tokio::test]
 async fn worker_shutdown_waits_for_in_flight_task() -> Result<(), Box<dyn StdError + Send + Sync>> {
     let test = setup().await?;
+    let started = Arc::new(Notify::new());
+    let task_started = Arc::clone(&started);
     let task = Task::<Input, Output>::builder("worker-task")?
         .queue("default")?
-        .handler(|_context, _input| async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(Output { value: 33 })
+        .handler(move |_context, _input| {
+            let started = Arc::clone(&task_started);
+            async move {
+                started.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(Output { value: 33 })
+            }
         })
         .build();
     let router = Router::new().task(task.clone())?;
@@ -578,7 +659,7 @@ async fn worker_shutdown_waits_for_in_flight_task() -> Result<(), Box<dyn StdErr
         .await
     });
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    started.notified().await;
     shutdown.cancel();
     worker
         .await

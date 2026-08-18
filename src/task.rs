@@ -251,8 +251,7 @@ impl Router {
     /// Defers a run with an unknown task name.
     async fn defer_unknown(&self, lease: RunLease) -> Result<()> {
         let jitter = jitter_duration(self.unknown_task_delay);
-        let wake_at = jiff::Timestamp::now().saturating_add(jitter)?;
-        match lease.sleep_until(wake_at).await {
+        match lease.sleep_for(jitter).await {
             Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
             Err(error) => Err(error),
         }

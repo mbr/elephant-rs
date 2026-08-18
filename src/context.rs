@@ -143,14 +143,16 @@ impl TaskContext {
     ) -> Result<()> {
         let step_name = step_name.as_ref().parse::<StepName>()?;
         let wake_at = self.sleep_checkpoint(step_name.as_str(), wake_at).await?;
-        if Timestamp::now() >= wake_at {
+        let now = Timestamp::now();
+        if now >= wake_at {
             return Ok(());
         }
+        let delay = Duration::try_from(wake_at.duration_since(now)).map_err(Error::jiff)?;
         self.client
-            .schedule_run(
+            .schedule_run_after(
                 self.metadata.queue_name.as_str(),
                 self.metadata.run_id.as_uuid(),
-                wake_at,
+                delay,
             )
             .await?;
         Err(Error::Suspended)

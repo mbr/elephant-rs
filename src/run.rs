@@ -131,10 +131,18 @@ impl RunLease {
         outcome
     }
 
-    /// Schedules the run to wake after a duration.
-    pub async fn sleep_for(self, duration: Duration) -> Result<()> {
-        let wake_at = Timestamp::now().saturating_add(duration)?;
-        self.sleep_until(wake_at).await
+    /// Schedules the run to wake after a database-relative duration.
+    pub async fn sleep_for(mut self, duration: Duration) -> Result<()> {
+        let queue_name = self.claimed_run().queue_name.clone();
+        let run_id = self.claimed_run().run_id;
+        let outcome = self
+            .client
+            .schedule_run_after(queue_name.as_str(), run_id.as_uuid(), duration)
+            .await;
+        if is_resolved_outcome(&outcome) {
+            self.run.take();
+        }
+        outcome
     }
 
     /// Explicitly abandons the lease.
