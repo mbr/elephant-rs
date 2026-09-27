@@ -637,6 +637,89 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
     Ok(())
 }
 
+/// Verifies that spare capacity does not prevent execution or completion.
+#[tokio::test]
+async fn worker_executes_below_capacity() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<Input, Output>::builder("single")?
+        .handler(|_, input| async move { Ok(Output { value: input.value }) })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, Input { value: 1 }).send().await?;
+    let shutdown = CancellationToken::new();
+    let client = test.client.clone();
+    let worker_shutdown = shutdown.clone();
+    let worker = tokio::spawn(async move {
+        client
+            .worker(router)
+            .concurrency(2)
+            .run(worker_shutdown)
+            .await
+    });
+    let result = spawned
+        .await_result(&test.client, Some(Duration::from_secs(1)))
+        .await;
+    shutdown.cancel();
+    worker.await.expect("worker should join")?;
+    assert_eq!(result?, Output { value: 1 });
+    Ok(())
+}
+
+/// Verifies that batch claims do not exceed available worker slots.
+#[tokio::test]
+async fn worker_limits_claims_to_capacity() -> TestResult {
+    let test = setup().await?;
+    let started = Arc::new(Notify::new());
+    let release = CancellationToken::new();
+    let task_started = Arc::clone(&started);
+    let task_release = release.clone();
+    let task = Task::<Input, Output>::builder("blocked")?
+        .handler(move |_, input| {
+            let started = Arc::clone(&task_started);
+            let release = task_release.clone();
+            async move {
+                started.notify_one();
+                release.cancelled().await;
+                Ok(Output { value: input.value })
+            }
+        })
+        .build();
+    for value in 0..4 {
+        test.client.spawn(&task, Input { value }).send().await?;
+    }
+    let router = Router::new().task(task)?;
+    let shutdown = CancellationToken::new();
+    let client = test.client.clone();
+    let worker_shutdown = shutdown.clone();
+    let worker = tokio::spawn(async move {
+        elephant::worker::run_worker(
+            client,
+            router,
+            WorkerOptions {
+                concurrency: 2,
+                claim: elephant::worker::ClaimOptions {
+                    batch_size: 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            worker_shutdown,
+        )
+        .await
+    });
+    let did_start = tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
+    let claimed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM absurd.r_default WHERE state = 'running'")
+            .fetch_one(test.client.pool())
+            .await?;
+    shutdown.cancel();
+    release.cancel();
+    worker.await.expect("worker should join")?;
+    did_start?;
+    assert_eq!(claimed, 2);
+    Ok(())
+}
+
 /// Verifies worker shutdown waits for in-flight tasks.
 #[tokio::test]
 async fn worker_shutdown_waits_for_in_flight_task() -> Result<(), Box<dyn StdError + Send + Sync>> {
