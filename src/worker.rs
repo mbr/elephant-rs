@@ -3,7 +3,7 @@
 use std::{collections::VecDeque, pin::Pin, task::Poll, time::Duration};
 
 use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -181,7 +181,7 @@ impl WorkerBuilder {
 
     /// Sets dispatch concurrency.
     pub fn concurrency(mut self, concurrency: usize) -> Self {
-        self.options.concurrency = concurrency.max(1);
+        self.options.concurrency = concurrency;
         self
     }
 
@@ -238,61 +238,80 @@ pub async fn work_batch(
     }
 }
 
-/// Runs a convenience worker loop.
+/// Runs a capacity-bounded worker, draining active work on shutdown or error.
+///
+/// An issued claim query is always awaited, including during shutdown, so its
+/// leases are dispatched rather than abandoned after a database commit.
 pub async fn run_worker(
     client: Client,
     router: Router,
     options: WorkerOptions,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let mut claims = client.claims(&options.queue_name, options.claim.clone());
+    if options.concurrency == 0 || options.claim.batch_size <= 0 {
+        return Err(Error::InvalidWorkerOptions {
+            reason: "concurrency and batch size must be positive",
+        });
+    }
     let mut in_flight = FuturesUnordered::<BoxFuture<'static, Result<()>>>::new();
+    let mut pending_claim: Option<BoxFuture<'static, Result<Vec<RunLease>>>> = None;
+    let mut next_poll = Instant::now();
+    let mut stopping = false;
+    let mut first_error = None;
     loop {
-        while in_flight.len() < options.concurrency {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                item = claims.next() => {
-                    let Some(lease) = item else {
-                        break;
-                    };
-                    let lease = match lease {
-                        Ok(lease) => lease,
-                        Err(error) => return drain_after_error(in_flight, error).await,
-                    };
-                    let router = router.clone();
-                    let watchdog = options.lease_watchdog.clone();
-                    in_flight.push(
-                        async move { dispatch_with_watchdog(router, lease, watchdog).await }
-                            .boxed(),
-                    );
+        stopping |= shutdown.is_cancelled();
+        if stopping && pending_claim.is_none() && in_flight.is_empty() {
+            return first_error.map_or(Ok(()), Err);
+        }
+        let error = tokio::select! {
+            _ = shutdown.cancelled(), if !stopping => {
+                stopping = true;
+                None
+            }
+            _ = sleep_until(next_poll), if !stopping
+                && pending_claim.is_none() && in_flight.len() < options.concurrency => {
+                let mut claim = options.claim.clone();
+                claim.batch_size = (claim.batch_size as usize)
+                    .min(options.concurrency - in_flight.len()) as i32;
+                let client = client.clone();
+                let queue = options.queue_name.clone();
+                pending_claim = Some(async move { client.claim_task(queue, &claim).await }.boxed());
+                None
+            }
+            result = async { pending_claim.as_mut().expect("claim branch is enabled").await },
+                if pending_claim.is_some() => {
+                pending_claim = None;
+                match result {
+                    Ok(leases) => {
+                        next_poll = Instant::now();
+                        if leases.is_empty() {
+                            next_poll += options.claim.empty_poll_delay;
+                        }
+                        for lease in leases {
+                            let router = router.clone();
+                            let watchdog = options.lease_watchdog.clone();
+                            in_flight.push(async move {
+                                dispatch_with_watchdog(router, lease, watchdog).await
+                            }.boxed());
+                        }
+                        None
+                    }
+                    Err(error) => Some(error),
                 }
             }
-        }
-        if shutdown.is_cancelled() && in_flight.is_empty() {
-            return Ok(());
-        }
-        tokio::select! {
-            _ = shutdown.cancelled(), if in_flight.is_empty() => return Ok(()),
             result = in_flight.next(), if !in_flight.is_empty() => {
-                if let Some(Err(error)) = result {
-                    return drain_after_error(in_flight, error).await;
-                }
+                result.and_then(Result::err)
+            }
+        };
+        if let Some(error) = error {
+            stopping = true;
+            if first_error.is_none() {
+                first_error = Some(error);
+            } else {
+                warn!(error = %error, "task dispatch failed during worker shutdown");
             }
         }
     }
-}
-
-/// Drains active dispatches before returning the first worker error.
-async fn drain_after_error(
-    mut in_flight: FuturesUnordered<BoxFuture<'static, Result<()>>>,
-    first_error: Error,
-) -> Result<()> {
-    while let Some(result) = in_flight.next().await {
-        if let Err(error) = result {
-            warn!(error = %error, "task dispatch failed during worker shutdown");
-        }
-    }
-    Err(first_error)
 }
 
 /// Dispatches a run while extending its claim.

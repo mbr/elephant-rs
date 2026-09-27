@@ -53,6 +53,12 @@ pub enum Error {
         /// Explains the validation failure.
         reason: &'static str,
     },
+    /// Indicates that worker configuration cannot make progress.
+    #[error("invalid worker options: {reason}")]
+    InvalidWorkerOptions {
+        /// Explains the invalid configuration.
+        reason: &'static str,
+    },
     /// Indicates that time arithmetic failed.
     #[error("time error")]
     Jiff {
