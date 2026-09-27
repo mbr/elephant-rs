@@ -954,6 +954,62 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
     Ok(())
 }
 
+/// Verifies that detected cancellation stops a handler that does not cooperate.
+#[tokio::test]
+async fn cancelled_lease_stops_handler() -> TestResult {
+    let test = setup().await?;
+    let started = Arc::new(Notify::new());
+    let release = CancellationToken::new();
+    let task_started = Arc::clone(&started);
+    let task_release = release.clone();
+    let task = Task::<Input, Output>::builder("cancel-active")?
+        .handler(move |_, input| {
+            let started = Arc::clone(&task_started);
+            let release = task_release.clone();
+            async move {
+                started.notify_one();
+                release.cancelled().await;
+                Ok(Output { value: input.value })
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, Input { value: 1 }).send().await?;
+    let shutdown = CancellationToken::new();
+    let worker_shutdown = shutdown.clone();
+    let client = test.client.clone();
+    let mut worker = tokio::spawn(async move {
+        client
+            .worker(router)
+            .lease_watchdog(LeaseWatchdogOptions {
+                interval: Duration::from_millis(10),
+                extend_by: Duration::from_secs(1),
+            })
+            .run(worker_shutdown)
+            .await
+    });
+    let did_start = tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
+    test.client
+        .cancel_task("default", spawned.result.task_id.as_uuid())
+        .await?;
+    shutdown.cancel();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+    let did_stop = match stopped {
+        Ok(result) => {
+            result.expect("worker should join")?;
+            true
+        }
+        Err(_) => {
+            release.cancel();
+            worker.await.expect("worker should join")?;
+            false
+        }
+    };
+    did_start?;
+    assert!(did_stop, "worker ignored detected task cancellation");
+    Ok(())
+}
+
 /// Verifies that spare capacity does not prevent execution or completion.
 #[tokio::test]
 async fn worker_executes_below_capacity() -> TestResult {
