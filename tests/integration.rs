@@ -560,6 +560,63 @@ async fn queue_policy_round_trips() -> Result<(), Box<dyn StdError + Send + Sync
     Ok(())
 }
 
+/// Verifies that an observed child result survives cleanup and parent retry.
+#[tokio::test]
+async fn child_result_replays_after_cleanup() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .create_queue("children", CreateQueueOptions::default())
+        .await?;
+    let child = Task::<Input, Output>::builder("child")?
+        .queue("children")?
+        .handler(|_, input| async move { Ok(Output { value: input.value }) })
+        .build();
+    let child_router = Router::new().task(child.clone())?;
+    let child = test
+        .client
+        .spawn(&child, Input { value: 42 })
+        .send()
+        .await?;
+    work_batch(&test.client, &child_router, "children").await?;
+    let parent = Task::<Input, Output>::builder("parent")?
+        .default_max_attempts(2)
+        .handler(move |context, _| {
+            let child = child.clone();
+            async move {
+                let result = context.await_task_result(&child, None).await?;
+                if context.metadata().attempt == 1 {
+                    return Err(Error::handler(Box::new(TestFailure)));
+                }
+                Ok(result)
+            }
+        })
+        .build();
+    let router = Router::new().task(parent.clone())?;
+    let parent = test
+        .client
+        .spawn(&parent, Input { value: 0 })
+        .send()
+        .await?;
+    work_batch(&test.client, &router, "default").await?;
+    test.client
+        .set_queue_policy(
+            "children",
+            QueuePolicyOptions {
+                cleanup_ttl: Some(PgInterval::from(Duration::ZERO)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let cleanup = test.client.cleanup_queue("children").await?;
+    assert_eq!(cleanup.iter().map(|row| row.tasks_deleted).sum::<i32>(), 1);
+    work_batch(&test.client, &router, "default").await?;
+    let result = parent
+        .await_result(&test.client, Some(Duration::from_secs(1)))
+        .await?;
+    assert_eq!(result, Output { value: 42 });
+    Ok(())
+}
+
 /// Verifies that a cancelled child fails its parent instead of abandoning it.
 #[tokio::test]
 async fn cancelled_child_resolves_parent_run() -> TestResult {
