@@ -13,13 +13,14 @@ use std::{
 use elephant::{
     client::Client,
     error::Error,
+    run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions},
     schema,
     task::{Router, Task},
     types::{
         CreateQueueOptions, PgInterval, QueueDetachMode, QueuePolicyOptions, RetryStrategy,
         SpawnOptions, TaskResultState,
     },
-    worker::{LeaseWatchdogOptions, WorkerOptions, work_batch},
+    worker::{WorkerOptions, work_batch},
 };
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -954,6 +955,114 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
     Ok(())
 }
 
+/// Verifies deadlines signal cleanup and fail even noncooperative dispatches.
+#[tokio::test]
+async fn execution_deadlines_resolve_manual_dispatch() -> TestResult {
+    let test = setup().await?;
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    for cooperative in [true, false] {
+        let handler_cleanups = Arc::clone(&cleanups);
+        let task = Task::<Input, Output>::builder("deadline")?
+            .default_max_attempts(1)
+            .handler(move |context, _| {
+                let cleanups = Arc::clone(&handler_cleanups);
+                async move {
+                    if cooperative {
+                        context.cancellation_token().cancelled().await;
+                        cleanups.fetch_add(1, Ordering::SeqCst);
+                        Ok(Output { value: 0 })
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            })
+            .build();
+        let router = Router::new().task(task.clone())?;
+        let spawned = test.client.spawn(&task, Input { value: 0 }).send().await?;
+        let lease = test
+            .client
+            .claim_task("default", &Default::default())
+            .await?
+            .pop()
+            .expect("deadline task should be claimable");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            router.dispatch_with(
+                lease,
+                ExecutionOptions {
+                    timeout: Some(Duration::from_millis(200)),
+                    cancellation_grace: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await??;
+        let snapshot = test
+            .client
+            .fetch_task_result("default", spawned.result.task_id.as_uuid())
+            .await?
+            .expect("task should exist");
+        assert_eq!(snapshot.state, TaskResultState::Failed);
+        assert_eq!(
+            snapshot.failure.expect("deadline should be recorded")["message"],
+            "execution deadline expired"
+        );
+    }
+    assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+/// Verifies renewal infrastructure errors stop work and leave database recovery.
+#[tokio::test]
+async fn renewal_errors_stop_dispatch_and_surface_to_supervisor() -> TestResult {
+    let test = setup().await?;
+    let cleaned_up = Arc::new(AtomicUsize::new(0));
+    let handler_cleanup = Arc::clone(&cleaned_up);
+    let task = Task::<Input, Output>::builder("renewal-error")?
+        .handler(move |context, _| {
+            let cleaned_up = Arc::clone(&handler_cleanup);
+            async move {
+                context.cancellation_token().cancelled().await;
+                cleaned_up.fetch_add(1, Ordering::SeqCst);
+                Ok(Output { value: 1 })
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, Input { value: 0 }).send().await?;
+    let lease = test
+        .client
+        .claim_task("default", &Default::default())
+        .await?
+        .pop()
+        .expect("task should be claimable");
+    sqlx::query("ALTER FUNCTION absurd.extend_claim(text, uuid, integer) RENAME TO unavailable_extend_claim")
+        .execute(test.client.pool()).await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        router.dispatch_with(
+            lease,
+            ExecutionOptions {
+                lease_renewal: LeaseRenewal::Custom(LeaseWatchdogOptions {
+                    interval: Duration::from_millis(100),
+                    extend_by: Duration::from_secs(1),
+                }),
+                ..Default::default()
+            },
+        ),
+    )
+    .await?;
+    assert!(matches!(result, Err(Error::Sqlx { .. })));
+    assert_eq!(cleaned_up.load(Ordering::SeqCst), 1);
+    let snapshot = test
+        .client
+        .fetch_task_result("default", spawned.result.task_id.as_uuid())
+        .await?
+        .expect("lease should remain recoverable");
+    assert_eq!(snapshot.state, TaskResultState::Running);
+    Ok(())
+}
+
 /// Verifies that detected cancellation stops a handler that does not cooperate.
 #[tokio::test]
 async fn cancelled_lease_stops_handler() -> TestResult {
@@ -1121,10 +1230,13 @@ async fn worker_shutdown_waits_for_in_flight_task() -> Result<(), Box<dyn StdErr
             router,
             WorkerOptions {
                 queue_name: "default".to_string(),
-                lease_watchdog: Some(LeaseWatchdogOptions {
-                    interval: Duration::from_millis(10),
-                    extend_by: Duration::from_secs(1),
-                }),
+                execution: ExecutionOptions {
+                    lease_renewal: LeaseRenewal::Custom(LeaseWatchdogOptions {
+                        interval: Duration::from_millis(10),
+                        extend_by: Duration::from_secs(1),
+                    }),
+                    ..Default::default()
+                },
                 ..WorkerOptions::default()
             },
             worker_shutdown,

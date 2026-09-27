@@ -1,10 +1,15 @@
 //! Claimed run primitives.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::{Future, pending},
+    time::Duration,
+};
 
 use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::{
@@ -12,6 +17,90 @@ use crate::{
     error::{Error, FailureReason, Result},
     types::{QueueName, RunId, TaskId, TaskName},
 };
+
+/// Defines the default claim duration for worker and lease configuration.
+pub(crate) const DEFAULT_CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Configures background claim renewal.
+#[derive(Clone, Debug)]
+pub struct LeaseWatchdogOptions {
+    /// Configures the delay between successful renewals.
+    pub interval: Duration,
+    /// Configures the lease duration requested by each renewal.
+    pub extend_by: Duration,
+}
+
+impl LeaseWatchdogOptions {
+    /// Derives a renewal schedule from a claim duration.
+    pub fn for_claim_timeout(claim_timeout: Duration) -> Self {
+        Self {
+            interval: (claim_timeout / 3).max(Duration::from_millis(1)),
+            extend_by: claim_timeout,
+        }
+    }
+}
+
+impl Default for LeaseWatchdogOptions {
+    /// Uses the default worker claim duration.
+    fn default() -> Self {
+        Self::for_claim_timeout(DEFAULT_CLAIM_TIMEOUT)
+    }
+}
+
+/// Selects how an execution keeps its database claim alive.
+#[derive(Clone, Debug, Default)]
+pub enum LeaseRenewal {
+    /// Leaves renewal to explicit heartbeats and checkpoint writes.
+    Disabled,
+    /// Derives renewal timing from the actual claimed run.
+    #[default]
+    Automatic,
+    /// Uses an application-selected renewal schedule.
+    Custom(LeaseWatchdogOptions),
+}
+
+/// Configures per-run supervision independently of worker shutdown.
+#[derive(Clone, Debug)]
+pub struct ExecutionOptions {
+    /// Configures background lease maintenance.
+    pub lease_renewal: LeaseRenewal,
+    /// Bounds one dispatch, including checkpoint loading and wrappers.
+    pub timeout: Option<Duration>,
+    /// Allows cooperative cleanup before dropping an interrupted future.
+    pub cancellation_grace: Duration,
+}
+
+impl Default for ExecutionOptions {
+    /// Enables automatic renewal without imposing an execution deadline.
+    fn default() -> Self {
+        Self {
+            lease_renewal: LeaseRenewal::Automatic,
+            timeout: None,
+            cancellation_grace: Duration::from_secs(1),
+        }
+    }
+}
+
+impl ExecutionOptions {
+    /// Rejects renewal settings that cannot maintain a lease.
+    pub(crate) fn validate(&self, claim_timeout: Duration) -> Result<()> {
+        if claim_timeout.is_zero() {
+            return Err(Error::InvalidExecutionOptions {
+                reason: "claim duration must be positive",
+            });
+        }
+        if let LeaseRenewal::Custom(options) = &self.lease_renewal
+            && (options.interval.is_zero()
+                || options.interval >= claim_timeout
+                || options.interval >= options.extend_by)
+        {
+            return Err(Error::InvalidExecutionOptions {
+                reason: "renewal interval must be positive and shorter than both lease durations",
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Represents a task run claimed from Absurd.
 #[derive(Clone, Debug)]
@@ -120,6 +209,60 @@ impl RunLease {
         ignore_terminal_error(outcome)
     }
 
+    /// Supervises work with renewal, a deadline, and cooperative cancellation.
+    ///
+    /// Cancellation signals cleanup through the supplied token, then drops the
+    /// future after the grace period. Local deadlines/cancellation fail the run.
+    /// Renewal errors abandon ownership and return infrastructure errors; known
+    /// database terminal states are successful local resolution. Blocking code
+    /// and side effects already sent externally cannot be interrupted reliably.
+    pub async fn run_supervised<T, Fut>(
+        self,
+        future: Fut,
+        options: ExecutionOptions,
+        cancellation: CancellationToken,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        Fut: Future<Output = Result<T>>,
+    {
+        options.validate(self.claimed_run().claim_timeout)?;
+        let client = self.client.clone();
+        let run = self.claimed_run().clone();
+        let mut future = Box::pin(future);
+        let stop = tokio::select! {
+            result = &mut future => {
+                drop(future);
+                return self.run(async { result }).await;
+            }
+            _ = cancellation.cancelled() => ExecutionStop::Cancelled,
+            _ = async {
+                match options.timeout {
+                    Some(duration) => sleep(duration).await,
+                    None => pending().await,
+                }
+            } => ExecutionStop::TimedOut,
+            error = watch_lease(client, run, &options.lease_renewal) => ExecutionStop::Lease(error),
+        };
+        cancellation.cancel();
+        let _ = timeout(options.cancellation_grace, &mut future).await;
+        drop(future);
+        match stop {
+            ExecutionStop::Lease(error) => {
+                self.forget();
+                ignore_terminal_error(Err(error))
+            }
+            ExecutionStop::TimedOut => {
+                self.run(async { Err::<T, _>(Error::ExecutionTimedOut) })
+                    .await
+            }
+            ExecutionStop::Cancelled => {
+                self.run(async { Err::<T, _>(Error::ExecutionCancelled) })
+                    .await
+            }
+        }
+    }
+
     /// Schedules the run to wake at an absolute timestamp.
     pub async fn sleep_until(mut self, wake_at: Timestamp) -> Result<()> {
         let queue_name = self.claimed_run().queue_name.clone();
@@ -156,6 +299,43 @@ impl RunLease {
     /// Removes the run from the lease.
     fn take_run(&mut self) -> ClaimedRun {
         self.run.take().expect("run lease must contain a run")
+    }
+}
+
+/// Identifies why execution was interrupted without conflating task results.
+enum ExecutionStop {
+    /// Carries a renewal failure or database terminal-state notification.
+    Lease(Error),
+    /// Indicates that the local dispatch deadline expired.
+    TimedOut,
+    /// Indicates that the application requested local cancellation.
+    Cancelled,
+}
+
+/// Renews claims until renewal fails or the monitor future is dropped.
+async fn watch_lease(client: Client, run: ClaimedRun, renewal: &LeaseRenewal) -> Error {
+    let options = match renewal {
+        LeaseRenewal::Disabled => return pending().await,
+        LeaseRenewal::Automatic => LeaseWatchdogOptions::for_claim_timeout(run.claim_timeout),
+        LeaseRenewal::Custom(options) => options.clone(),
+    };
+    let mut deadline = Instant::now() + run.claim_timeout;
+    loop {
+        let renewal = async {
+            sleep(options.interval).await;
+            client
+                .extend_claim(
+                    run.queue_name.as_str(),
+                    run.run_id.as_uuid(),
+                    options.extend_by,
+                )
+                .await
+        };
+        match timeout_at(deadline, renewal).await {
+            Ok(Ok(())) => deadline = Instant::now() + options.extend_by,
+            Ok(Err(error)) => return error,
+            Err(_) => return Error::LeaseRenewalTimeout,
+        }
     }
 }
 

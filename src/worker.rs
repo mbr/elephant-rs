@@ -10,9 +10,8 @@ use tracing::warn;
 use crate::{
     client::Client,
     error::{Error, Result},
-    run::{ClaimedRun, RunLease},
+    run::{DEFAULT_CLAIM_TIMEOUT, ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions, RunLease},
     task::Router,
-    types::{QueueName, RunId, TaskId, TaskName},
 };
 
 /// Configures calls to `absurd.claim_task`.
@@ -33,36 +32,10 @@ impl Default for ClaimOptions {
     fn default() -> Self {
         Self {
             worker_id: "elephant-worker".to_string(),
-            claim_timeout: Duration::from_secs(30),
+            claim_timeout: DEFAULT_CLAIM_TIMEOUT,
             batch_size: 1,
             empty_poll_delay: Duration::from_millis(250),
         }
-    }
-}
-
-/// Configures automatic claim extension.
-#[derive(Clone, Debug)]
-pub struct LeaseWatchdogOptions {
-    /// Configures how often the claim is extended.
-    pub interval: Duration,
-    /// Configures the extension requested on each heartbeat.
-    pub extend_by: Duration,
-}
-
-impl LeaseWatchdogOptions {
-    /// Creates watchdog options from a claim timeout.
-    pub fn for_claim_timeout(claim_timeout: Duration) -> Self {
-        Self {
-            interval: (claim_timeout / 3).max(Duration::from_secs(1)),
-            extend_by: claim_timeout,
-        }
-    }
-}
-
-impl Default for LeaseWatchdogOptions {
-    /// Creates default watchdog options.
-    fn default() -> Self {
-        Self::for_claim_timeout(ClaimOptions::default().claim_timeout)
     }
 }
 
@@ -137,8 +110,8 @@ pub struct WorkerOptions {
     pub claim: ClaimOptions,
     /// Configures dispatch concurrency.
     pub concurrency: usize,
-    /// Configures automatic claim extension.
-    pub lease_watchdog: Option<LeaseWatchdogOptions>,
+    /// Configures per-run deadlines, renewal, and cancellation.
+    pub execution: ExecutionOptions,
 }
 
 impl Default for WorkerOptions {
@@ -148,7 +121,7 @@ impl Default for WorkerOptions {
             queue_name: "default".to_string(),
             claim: ClaimOptions::default(),
             concurrency: 1,
-            lease_watchdog: Some(LeaseWatchdogOptions::default()),
+            execution: ExecutionOptions::default(),
         }
     }
 }
@@ -188,19 +161,36 @@ impl WorkerBuilder {
     /// Sets claim timeout.
     pub fn claim_timeout(mut self, claim_timeout: Duration) -> Self {
         self.options.claim.claim_timeout = claim_timeout;
-        self.options.lease_watchdog = Some(LeaseWatchdogOptions::for_claim_timeout(claim_timeout));
         self
     }
 
     /// Sets automatic claim extension options.
     pub fn lease_watchdog(mut self, options: LeaseWatchdogOptions) -> Self {
-        self.options.lease_watchdog = Some(options);
+        self.options.execution.lease_renewal = LeaseRenewal::Custom(options);
         self
     }
 
     /// Disables automatic claim extension.
     pub fn without_lease_watchdog(mut self) -> Self {
-        self.options.lease_watchdog = None;
+        self.options.execution.lease_renewal = LeaseRenewal::Disabled;
+        self
+    }
+
+    /// Configures all per-run supervision settings.
+    pub fn execution(mut self, options: ExecutionOptions) -> Self {
+        self.options.execution = options;
+        self
+    }
+
+    /// Sets a deadline for each dispatch without limiting durable workflow age.
+    pub fn execution_timeout(mut self, timeout: Duration) -> Self {
+        self.options.execution.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the cooperative cleanup period after execution interruption.
+    pub fn cancellation_grace(mut self, grace: Duration) -> Self {
+        self.options.execution.cancellation_grace = grace;
         self
     }
 
@@ -253,6 +243,7 @@ pub async fn run_worker(
             reason: "concurrency and batch size must be positive",
         });
     }
+    options.execution.validate(options.claim.claim_timeout)?;
     let mut in_flight = FuturesUnordered::<BoxFuture<'static, Result<()>>>::new();
     let mut pending_claim: Option<BoxFuture<'static, Result<Vec<RunLease>>>> = None;
     let mut next_poll = Instant::now();
@@ -289,9 +280,9 @@ pub async fn run_worker(
                         }
                         for lease in leases {
                             let router = router.clone();
-                            let watchdog = options.lease_watchdog.clone();
+                            let execution = options.execution.clone();
                             in_flight.push(async move {
-                                dispatch_with_watchdog(router, lease, watchdog).await
+                                router.dispatch_with(lease, execution).await
                             }.boxed());
                         }
                         None
@@ -310,94 +301,6 @@ pub async fn run_worker(
             } else {
                 warn!(error = %error, "task dispatch failed during worker shutdown");
             }
-        }
-    }
-}
-
-/// Dispatches a run while extending its claim.
-async fn dispatch_with_watchdog(
-    router: Router,
-    lease: RunLease,
-    options: Option<LeaseWatchdogOptions>,
-) -> Result<()> {
-    let Some(options) = options else {
-        return router.dispatch(lease).await;
-    };
-    let metadata = LeaseMetadata::from_run(lease.claimed_run());
-    let client = lease.client().clone();
-    let shutdown = CancellationToken::new();
-    let watchdog_shutdown = shutdown.clone();
-    let dispatch = async {
-        let result = router.dispatch(lease).await;
-        shutdown.cancel();
-        result
-    };
-    let (result, ()) = tokio::join!(
-        dispatch,
-        watch_lease(client, metadata, options, watchdog_shutdown)
-    );
-    result
-}
-
-/// Extends a lease until the watchdog is cancelled.
-async fn watch_lease(
-    client: Client,
-    metadata: LeaseMetadata,
-    options: LeaseWatchdogOptions,
-    shutdown: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return,
-            () = sleep(options.interval) => {}
-        }
-        if shutdown.is_cancelled() {
-            return;
-        }
-        match client
-            .extend_claim(
-                metadata.queue_name.as_str(),
-                metadata.run_id.as_uuid(),
-                options.extend_by,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(Error::Cancelled | Error::RunAlreadyFailed) => return,
-            Err(error) => warn!(
-                queue = %metadata.queue_name,
-                task_id = %metadata.task_id,
-                run_id = %metadata.run_id,
-                task_name = %metadata.task_name,
-                error = %error,
-                "lease extension failed"
-            ),
-        }
-    }
-}
-
-/// Carries metadata needed to extend a claim.
-#[derive(Clone, Debug)]
-struct LeaseMetadata {
-    /// Names the queue.
-    queue_name: QueueName,
-    /// Identifies the task.
-    task_id: TaskId,
-    /// Identifies the run.
-    run_id: RunId,
-    /// Names the task.
-    task_name: TaskName,
-}
-
-impl LeaseMetadata {
-    /// Creates metadata from a claimed run.
-    fn from_run(run: &ClaimedRun) -> Self {
-        Self {
-            queue_name: run.queue_name.clone(),
-            task_id: run.task_id,
-            run_id: run.run_id,
-            task_name: run.task_name.clone(),
         }
     }
 }

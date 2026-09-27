@@ -121,8 +121,59 @@ client.worker(router).concurrency(8).run(shutdown).await?;
 # }
 ```
 
-The convenience worker automatically extends active claims. Use the manual claim
-stream when the application needs custom supervision or backpressure.
+The convenience worker automatically extends active claims. Each claim batch is
+bounded by free execution slots. Shutdown stops new claims and drains both
+issued claim queries and active executions; it does not cancel handlers.
+Infrastructure errors likewise stop claiming, drain active work, and return to
+the application supervisor. Handler failures are recorded for database retry.
+
+## Execution supervision
+
+`Router::dispatch_with` and `RunLease::run_supervised` expose the same supervision
+used by workers. `run::ExecutionOptions` selects automatic, custom, or disabled
+background renewal, an optional per-dispatch deadline, and a cancellation grace
+period. Automatic renewal uses the actual claimed lease duration. The deadline
+covers one dispatch, not the entire durable workflow across sleeps and retries.
+
+`TaskContext::cancellation_token()` signals cooperative cleanup. Detected lease
+cancellation/failure, renewal errors, and execution deadlines signal this token;
+after the grace period, the handler future is dropped. Local deadlines and local
+token cancellation fail the run normally. Known database terminal states are
+not failed again. Renewal infrastructure errors abandon the lease for database
+recovery and return an error. A renewal request is bounded by the locally known
+lease deadline; it cannot hang indefinitely while work continues unprotected.
+
+Blocking code cannot be preempted by an async deadline, and dropping a future
+does not undo external effects or stop detached tasks. Handlers must cooperate,
+avoid detached work, and use idempotency keys. The SDK never terminates the
+process. There is no execution deadline by default; configure one for work that
+must not renew forever.
+
+```rust,no_run
+use elephant::{client::Client, run::ExecutionOptions, task::Router, worker::ClaimOptions};
+use futures::StreamExt;
+use std::time::Duration;
+
+# async fn example(client: Client, router: Router) -> elephant::error::Result<()> {
+let options = ExecutionOptions {
+    timeout: Some(Duration::from_secs(300)),
+    cancellation_grace: Duration::from_secs(2),
+    ..Default::default()
+};
+let mut claims = client.claims("default", ClaimOptions::default());
+while let Some(lease) = claims.next().await {
+    router.dispatch_with(lease?, options.clone()).await?;
+}
+# Ok(())
+# }
+```
+
+For workers, use `.execution(options)`, or `.execution_timeout(duration)` and
+`.cancellation_grace(duration)`. Bare `Router::dispatch` and `work_batch` do not
+renew in the background or impose a deadline. Checkpoint writes and durable
+child-result polling still renew their claims. Manual streams can buffer an
+already-claimed batch: keep the batch within your immediately available
+capacity, and do not abandon in-flight claim queries during shutdown.
 
 ## Sleeps and events
 

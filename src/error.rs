@@ -29,6 +29,21 @@ pub enum Error {
     /// Indicates that an event wait reached its timeout.
     #[error("event wait timed out")]
     EventTimeout,
+    /// Indicates that application cancellation interrupted the active execution.
+    #[error("execution was cancelled locally")]
+    ExecutionCancelled,
+    /// Indicates that the per-dispatch execution deadline expired.
+    #[error("execution deadline expired")]
+    ExecutionTimedOut,
+    /// Indicates that execution supervision was configured inconsistently.
+    #[error("invalid execution options: {reason}")]
+    InvalidExecutionOptions {
+        /// Explains the invalid configuration.
+        reason: &'static str,
+    },
+    /// Indicates that renewal could not finish within the locally known lease.
+    #[error("lease renewal exceeded the current claim deadline")]
+    LeaseRenewalTimeout,
     /// Indicates that a task handler returned an error.
     #[error("handler failed: {source}")]
     Handler {

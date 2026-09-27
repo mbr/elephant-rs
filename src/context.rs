@@ -12,6 +12,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::time::{Instant, interval_at};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     client::Client,
@@ -46,6 +47,10 @@ pub struct TaskContext {
     metadata: Arc<TaskMetadata>,
     /// Carries the original lease duration for durable polling waits.
     claim_timeout: Duration,
+    /// Signals that supervised execution is stopping.
+    cancellation: CancellationToken,
+    /// Indicates that the dispatch supervisor owns background renewal.
+    renewed_in_background: bool,
     /// Caches visible checkpoint payloads.
     checkpoints: Arc<Mutex<HashMap<String, Value>>>,
     /// Carries the claim extension used by checkpoint writes.
@@ -66,9 +71,30 @@ impl TaskContext {
                 headers: run.headers.clone(),
             }),
             claim_timeout: run.claim_timeout,
+            cancellation: CancellationToken::new(),
+            renewed_in_background: false,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
             checkpoint_extend_by: Some(run.claim_timeout),
         }
+    }
+
+    /// Shares cancellation with the execution supervisor.
+    pub(crate) fn with_supervision(
+        mut self,
+        cancellation: CancellationToken,
+        renewed_in_background: bool,
+    ) -> Self {
+        self.cancellation = cancellation;
+        self.renewed_in_background = renewed_in_background;
+        self
+    }
+
+    /// Returns the signal used for cooperative execution cancellation.
+    ///
+    /// Cancelling this token requests local run failure, not database-wide task
+    /// cancellation. Worker shutdown alone does not cancel it.
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation
     }
 
     /// Returns task metadata.
@@ -317,7 +343,7 @@ impl TaskContext {
                 loop {
                     tokio::select! {
                         result = &mut wait => return result,
-                        _ = heartbeat.tick() => self.heartbeat(self.claim_timeout).await?,
+                        _ = heartbeat.tick(), if !self.renewed_in_background => self.heartbeat(self.claim_timeout).await?,
                     }
                 }
             })

@@ -9,11 +9,12 @@ use futures::{FutureExt, future::BoxFuture};
 use rand::Rng;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     context::TaskContext,
     error::{Error, Result},
-    run::RunLease,
+    run::{ExecutionOptions, LeaseRenewal, RunLease},
     types::{CancellationPolicy, QueueName, TaskName},
 };
 
@@ -283,7 +284,19 @@ impl Router {
         self
     }
 
-    /// Dispatches a claimed run without background lease supervision.
+    /// Dispatches a claimed run without background renewal or a deadline.
+    pub async fn dispatch(&self, lease: RunLease) -> Result<()> {
+        self.dispatch_with(
+            lease,
+            ExecutionOptions {
+                lease_renewal: LeaseRenewal::Disabled,
+                ..ExecutionOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Dispatches with the same supervision primitives used by workers.
     #[tracing::instrument(
         level = "error", skip_all,
         fields(queue = %lease.claimed_run().queue_name,
@@ -292,24 +305,29 @@ impl Router {
             task_name = %lease.claimed_run().task_name,
             attempt = lease.claimed_run().attempt)
     )]
-    pub async fn dispatch(&self, lease: RunLease) -> Result<()> {
+    pub async fn dispatch_with(&self, lease: RunLease, options: ExecutionOptions) -> Result<()> {
+        options.validate(lease.claimed_run().claim_timeout)?;
         let client = lease.client().clone();
         let run = lease.claimed_run().clone();
         let Some(task) = self.tasks.get(&run.task_name).cloned() else {
             return self.defer_unknown(lease).await;
         };
-        let checkpoints = client
-            .get_checkpoints(
-                run.queue_name.as_str(),
-                run.task_id.as_uuid(),
-                run.run_id.as_uuid(),
-            )
-            .await?
-            .into_iter()
-            .collect();
-        let context = TaskContext::new(client, &run, checkpoints);
+        let cancellation = CancellationToken::new();
+        let context_cancellation = cancellation.clone();
+        let renewed_in_background = !matches!(&options.lease_renewal, LeaseRenewal::Disabled);
         let wrapper = self.execution_wrapper.clone();
         let execute = async move {
+            let checkpoints = client
+                .get_checkpoints(
+                    run.queue_name.as_str(),
+                    run.task_id.as_uuid(),
+                    run.run_id.as_uuid(),
+                )
+                .await?
+                .into_iter()
+                .collect();
+            let context = TaskContext::new(client, &run, checkpoints)
+                .with_supervision(context_cancellation, renewed_in_background);
             let wrapped_context = context.clone();
             let execute = async move { (task.handler)(context, run.params).await }.boxed();
             match wrapper {
@@ -318,12 +336,16 @@ impl Router {
             }
         };
         lease
-            .run(async move {
-                AssertUnwindSafe(execute)
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|payload| Err(Error::handler_panicked(payload)))
-            })
+            .run_supervised(
+                async move {
+                    AssertUnwindSafe(execute)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|payload| Err(Error::handler_panicked(payload)))
+                },
+                options,
+                cancellation,
+            )
             .await
     }
 
