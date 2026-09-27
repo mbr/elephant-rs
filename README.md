@@ -133,7 +133,9 @@ the application supervisor. Handler failures are recorded for database retry.
 `Router::dispatch_with` and `RunLease::run_supervised` expose the same supervision
 used by workers. `run::ExecutionOptions` selects automatic, custom, or disabled
 background renewal, an optional per-dispatch deadline, and a cancellation grace
-period. Automatic renewal uses the actual claimed lease duration. The deadline
+period. Automatic renewal uses the actual claimed lease duration and local
+request start, accounting for time buffered before dispatch. Locally expired
+claims are rejected before the handler starts. The deadline
 covers one dispatch, not the entire durable workflow across sleeps and retries.
 
 `TaskContext::cancellation_token()` signals cooperative cleanup. Detected lease

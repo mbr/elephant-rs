@@ -86,8 +86,11 @@ hatches; consuming wrappers do not enforce distributed ownership by themselves.
 
 Dropping an unresolved lease emits a warning and performs no asynchronous
 cleanup. `forget` deliberately leaves database recovery responsible for the
-run. Claimed metadata records the effective lease duration used by the database,
-so contexts and automatic renewal share the same timing basis.
+run. Claimed metadata records the effective lease duration used by the database
+and the monotonic local request start. Automatic renewal accounts for time spent
+buffered before dispatch and refuses to start work under a locally expired
+claim. Request start, rather than response receipt, also anchors renewal
+deadlines conservatively.
 
 `RunLease::run` resolves successful values, records ordinary failures, and
 recognizes owning-run suspension/cancellation/already-failed control signals.

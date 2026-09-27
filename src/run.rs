@@ -8,7 +8,7 @@ use std::{
 use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -115,6 +115,8 @@ pub struct ClaimedRun {
     pub attempt: i32,
     /// Carries the effective lease duration requested when claiming this run.
     pub claim_timeout: Duration,
+    /// Records the local request start as a conservative claim-age reference.
+    pub claim_started_at: Instant,
     /// Names the task handler.
     pub task_name: TaskName,
     /// Carries the raw parameter payload.
@@ -229,6 +231,13 @@ impl RunLease {
         options.validate(self.claimed_run().claim_timeout)?;
         let client = self.client.clone();
         let run = self.claimed_run().clone();
+        if !matches!(&options.lease_renewal, LeaseRenewal::Disabled)
+            && Instant::now() >= run.claim_started_at + run.claim_timeout
+        {
+            cancellation.cancel();
+            self.forget();
+            return Err(Error::LeaseRenewalTimeout);
+        }
         let mut future = Box::pin(future);
         let stop = tokio::select! {
             result = &mut future => {
@@ -324,20 +333,26 @@ async fn watch_lease(client: Client, run: ClaimedRun, renewal: &LeaseRenewal) ->
         LeaseRenewal::Automatic => LeaseWatchdogOptions::for_claim_timeout(run.claim_timeout),
         LeaseRenewal::Custom(options) => options.clone(),
     };
-    let mut deadline = Instant::now() + run.claim_timeout;
+    let mut deadline = run.claim_started_at + run.claim_timeout;
+    let mut next_renewal = run.claim_started_at + options.interval;
     loop {
         let renewal = async {
-            sleep(options.interval).await;
+            sleep_until(next_renewal).await;
+            let requested_at = Instant::now();
             client
                 .extend_claim(
                     run.queue_name.as_str(),
                     run.run_id.as_uuid(),
                     options.extend_by,
                 )
-                .await
+                .await?;
+            Ok(requested_at + options.extend_by)
         };
         match timeout_at(deadline, renewal).await {
-            Ok(Ok(())) => deadline = Instant::now() + options.extend_by,
+            Ok(Ok(renewed_deadline)) => {
+                deadline = renewed_deadline;
+                next_renewal = Instant::now() + options.interval;
+            }
             Ok(Err(error)) => return error,
             Err(_) => return Error::LeaseRenewalTimeout,
         }

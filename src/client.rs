@@ -6,7 +6,7 @@ use jiff::Timestamp;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Row, types::Json};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::{
@@ -241,6 +241,8 @@ impl Client {
     ) -> Result<Vec<RunLease>> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
         let claim_timeout = seconds_i32(options.claim_timeout)?;
+        let mut connection = self.pool.acquire().await?;
+        let claim_started_at = Instant::now();
         let rows = sqlx::query(
             "SELECT run_id, task_id, attempt, task_name, params, headers, wake_event, event_payload \
              FROM absurd.claim_task($1, $2, $3, $4)",
@@ -249,7 +251,7 @@ impl Client {
         .bind(&options.worker_id)
         .bind(claim_timeout)
         .bind(options.batch_size)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(Error::from_sqlx)?;
 
@@ -266,6 +268,7 @@ impl Client {
                     ),
                     attempt: row.try_get("attempt").map_err(Error::from_sqlx)?,
                     claim_timeout: Duration::from_secs(claim_timeout as u64),
+                    claim_started_at,
                     task_name: TaskName::from_str(
                         &row.try_get::<String, _>("task_name")
                             .map_err(Error::from_sqlx)?,
