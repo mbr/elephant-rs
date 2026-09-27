@@ -560,6 +560,44 @@ async fn queue_policy_round_trips() -> Result<(), Box<dyn StdError + Send + Sync
     Ok(())
 }
 
+/// Verifies that a cancelled child fails its parent instead of abandoning it.
+#[tokio::test]
+async fn cancelled_child_resolves_parent_run() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .create_queue("children", CreateQueueOptions::default())
+        .await?;
+    let child = Task::<Input, Output>::builder("child")?
+        .queue("children")?
+        .handler(|_, input| async move { Ok(Output { value: input.value }) })
+        .build();
+    let child = test.client.spawn(&child, Input { value: 1 }).send().await?;
+    test.client
+        .cancel_task("children", child.result.task_id.as_uuid())
+        .await?;
+    let parent = Task::<Input, Output>::builder("parent")?
+        .default_max_attempts(1)
+        .handler(move |context, _| {
+            let child = child.clone();
+            async move { context.await_task_result(&child, None).await }
+        })
+        .build();
+    let router = Router::new().task(parent.clone())?;
+    let parent = test
+        .client
+        .spawn(&parent, Input { value: 0 })
+        .send()
+        .await?;
+    work_batch(&test.client, &router, "default").await?;
+    let snapshot = test
+        .client
+        .fetch_task_result("default", parent.result.task_id.as_uuid())
+        .await?
+        .expect("parent should exist");
+    assert_eq!(snapshot.state, TaskResultState::Failed);
+    Ok(())
+}
+
 /// Verifies same-queue waits are rejected in task contexts.
 #[tokio::test]
 async fn same_queue_task_wait_is_rejected() -> Result<(), Box<dyn StdError + Send + Sync>> {
