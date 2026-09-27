@@ -139,6 +139,38 @@ async fn spawned_task_completes_through_router() -> Result<(), Box<dyn StdError 
     Ok(())
 }
 
+/// Verifies that typed handlers receive application headers.
+#[tokio::test]
+async fn headers_reach_typed_handlers() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<Input, Output>::builder("headers")?
+        .handler(|context, _| async move {
+            let headers = context
+                .metadata()
+                .headers
+                .as_ref()
+                .expect("spawned headers should be retained");
+            assert_eq!(headers["traceparent"], "parent-span");
+            Ok(Output { value: 1 })
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test
+        .client
+        .spawn(&task, Input { value: 0 })
+        .headers(serde_json::json!({"traceparent": "parent-span"}))?
+        .send()
+        .await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        Output { value: 1 }
+    );
+    Ok(())
+}
+
 /// Verifies that business writes, task spawning, and events share transactions.
 #[tokio::test]
 async fn enqueue_and_emit_follow_caller_transaction() -> TestResult {
