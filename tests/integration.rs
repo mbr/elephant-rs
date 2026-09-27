@@ -1062,6 +1062,45 @@ async fn execution_deadlines_resolve_manual_dispatch() -> TestResult {
     Ok(())
 }
 
+/// Verifies that a stalled renewal cannot outlive the local claim deadline.
+#[tokio::test]
+async fn stalled_renewal_is_bounded_by_claim_deadline() -> TestResult {
+    let test = setup_with_max_connections(1).await?;
+    test.client
+        .spawn_untyped("stalled", Input { value: 0 }, SpawnOptions::default())
+        .await?;
+    let lease = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                claim_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("task should be claimable");
+    let connection = test.client.pool().acquire().await?;
+    let cancellation = CancellationToken::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        lease.run_supervised(
+            std::future::pending::<elephant::error::Result<()>>(),
+            ExecutionOptions {
+                cancellation_grace: Duration::ZERO,
+                ..Default::default()
+            },
+            cancellation.clone(),
+        ),
+    )
+    .await?;
+    drop(connection);
+    assert!(matches!(result, Err(Error::LeaseRenewalTimeout)));
+    assert!(cancellation.is_cancelled());
+    Ok(())
+}
+
 /// Verifies renewal infrastructure errors stop work and leave database recovery.
 #[tokio::test]
 async fn renewal_errors_stop_dispatch_and_surface_to_supervisor() -> TestResult {

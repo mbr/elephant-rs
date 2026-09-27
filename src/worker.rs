@@ -308,3 +308,70 @@ pub async fn run_worker(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Checks invalid worker configuration without contacting PostgreSQL.
+
+    use std::time::Duration;
+
+    use sqlx::postgres::PgPoolOptions;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ClaimOptions, WorkerOptions, run_worker};
+    use crate::{
+        client::Client,
+        error::Error,
+        run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions},
+        task::Router,
+    };
+
+    /// Rejects non-progressing worker and renewal settings before claiming.
+    #[tokio::test]
+    async fn invalid_options_are_rejected_before_database_access() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/absurd")
+            .expect("test URL should parse");
+        let client = Client::builder(pool).build();
+        let cases = [
+            WorkerOptions {
+                concurrency: 0,
+                ..Default::default()
+            },
+            WorkerOptions {
+                claim: ClaimOptions {
+                    batch_size: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            WorkerOptions {
+                execution: ExecutionOptions {
+                    lease_renewal: LeaseRenewal::Custom(LeaseWatchdogOptions {
+                        interval: Duration::ZERO,
+                        extend_by: Duration::from_secs(1),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+        for options in cases {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_worker(
+                    client.clone(),
+                    Router::new(),
+                    options,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("validation should not perform I/O");
+            assert!(matches!(
+                result,
+                Err(Error::InvalidWorkerOptions { .. } | Error::InvalidExecutionOptions { .. })
+            ));
+        }
+    }
+}
