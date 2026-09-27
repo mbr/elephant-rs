@@ -292,6 +292,8 @@ async fn checkpoint_replay_skips_completed_step() -> Result<(), Box<dyn StdError
                         }
                     })
                     .await?;
+                let repeated = context.step("once", || async { Ok(999) }).await?;
+                assert_eq!(repeated, value);
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(Error::handler(Box::new(TestFailure)));
                 }
@@ -337,6 +339,17 @@ async fn event_wait_resumes_after_emit() -> Result<(), Box<dyn StdError + Send +
         .await?;
 
     assert_eq!(result, Output { value: 99 });
+    let checkpoint = test
+        .client
+        .get_checkpoint(
+            "default",
+            spawned.result.task_id.as_uuid(),
+            "event:ready",
+            false,
+        )
+        .await?
+        .expect("default event key should remain compatible");
+    assert_eq!(checkpoint.state, serde_json::json!({"value": 99}));
     Ok(())
 }
 
@@ -369,6 +382,20 @@ async fn sleep_replays_after_wakeup() -> Result<(), Box<dyn StdError + Send + Sy
         .await?
         .expect("sleeping task should be visible");
     assert_eq!(sleeping.state, TaskResultState::Sleeping);
+    let checkpoint = test
+        .client
+        .get_checkpoint(
+            "default",
+            spawned.result.task_id.as_uuid(),
+            "short-sleep",
+            false,
+        )
+        .await?
+        .expect("sleep should persist its wake time");
+    let wake_at = checkpoint.state["wake_at"]
+        .as_str()
+        .expect("sleep format uses a timestamp field");
+    wake_at.parse::<Timestamp>()?;
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     work_batch(&test.client, &router, "default").await?;

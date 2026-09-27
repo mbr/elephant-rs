@@ -186,7 +186,44 @@ multiple sleeps or sleeps in a loop.
 
 Waiting for a task result from the same queue inside a task is rejected because it
 can deadlock a worker pool. Cross-queue waits are available through
-`TaskContext::await_task_result`.
+`TaskContext::await_task_result` and `await_task_result_named`. They checkpoint the
+terminal snapshot before decoding, so replay survives child cleanup, including
+failed or cancelled child results. A cancelled child produces `Error::TaskCancelled`,
+not the owning-run control signal `Error::Cancelled`.
+
+Child-result waits poll while occupying a worker slot; they do not durably
+suspend the run. Cross-queue dependency cycles can still deadlock. The raw
+`Client` result APIs are non-durable and intentionally do not enforce contextual
+same-queue restrictions.
+
+## Checkpoint compatibility
+
+Checkpoint identity is an exact name. Repeating `step("charge", ...)` returns the
+same saved value, including within a loop. For multiple operations, use stable
+logical IDs such as `charge:{order_id}`, not iteration order. Concurrent use of
+the same name is not single-flight: multiple closures can execute before either
+writes its checkpoint. Version names when payload shape or meaning changes.
+
+The Go, Python, and TypeScript SDKs in Absurd `0.5.0` instead assign occurrence
+suffixes (`charge`, `charge#2`, ...). Literal translations of their loops are not
+behaviorally equivalent. Elephant deliberately retains explicit exact-name
+identity rather than adopting implicit occurrence counters.
+
+Persisted conventions are also part of the compatibility contract:
+
+| Operation | Elephant checkpoint convention |
+| --- | --- |
+| Step | Exact caller name; serialized successful value |
+| Sleep | Caller name, or `sleep`; object with a `wake_at` timestamp string |
+| Event | Caller name, or `event:{event_name}`; raw event payload |
+| Child result | Caller name, or `$awaitTaskResult:{task_id}`; terminal snapshot |
+
+Do not reuse generated names for unrelated steps. Upstream sleep checkpoints
+are timestamp strings, not Elephant's object; upstream default event names use
+`$awaitEvent:`. These existing Elephant formats are intentionally preserved.
+Cross-language enqueueing works with agreed JSON parameter/result schemas, but
+taking over existing workflow executions requires explicit checkpoint-name and
+payload migration. Sharing the SQL schema alone is not sufficient.
 
 ## Execution instrumentation
 
