@@ -122,7 +122,8 @@ allowing rolling deployments with different registered task sets.
 The manual `ClaimStream` exposes batch semantics, including already-claimed
 buffered leases. Its caller owns capacity planning, continuous polling, and safe
 shutdown of issued queries. Keep its batch size within immediately available
-capacity. `work_batch` and bare `Router::dispatch` do not renew in the background.
+capacity. `work_batch` and bare `Router::dispatch` enforce default stall recovery
+without background renewal; `RunLease::run` remains explicitly unsupervised.
 
 ## Execution supervision
 
@@ -133,18 +134,35 @@ its interval and extension from the claimed lease, rather than a separate fixed
 worker default. Custom intervals must be positive and shorter than both the
 initial and renewed lease durations.
 
-An optional timeout bounds one dispatch, including checkpoint loading and
-execution wrappers. It is not a limit on total workflow lifetime across sleeps
-and retries. There is no execution deadline by default.
+Default `StallTimeout::ClaimDuration` bounds inactivity by the latest
+application-requested effective lease duration, initially the claimed duration.
+Only successful checkpoint writes, event checkpoint writes, and explicit context
+heartbeats reset application progress. Cached reads, failed operations, raw
+client calls, and background renewal cannot keep an otherwise hung handler
+alive. Context clones share one progress tracker. Heartbeat/checkpoint durations
+use the same whole-second rounding as their database lease extensions.
+
+`StallTimeout::After` chooses a fixed inactivity window; `Disabled` explicitly
+allows indefinite renewal without progress. An optional overall timeout bounds
+one dispatch, including checkpoint loading and execution wrappers, independently
+of progress. It is not a limit on workflow lifetime across sleeps and retries.
+Raw supervised futures without a routed context receive no progress reports and
+must explicitly configure a different stall policy for long opaque work.
+After execution/cleanup, terminal persistence has a separate budget equal to the
+original claim duration. A blocked completion/failure query returns
+`RunResolutionTimeout` rather than holding capacity indefinitely. Its database
+outcome is uncertain; cancellation of the local future is not a rollback promise.
 
 The context exposes a cancellation token for cooperative cleanup. Local
-cancellation, dispatch deadlines, detected terminal lease states, and renewal
-infrastructure failures signal it. After `cancellation_grace`, the future is
-dropped if it has not returned. Its late result does not override the reason
+cancellation, stalled execution, dispatch deadlines, detected terminal lease
+states, and renewal infrastructure failures signal it. After `cancellation_grace`,
+the future is dropped if it has not returned. Its late result does not override the reason
 execution was interrupted.
 
-Local cancellation and deadlines fail the run normally. A known database
-cancelled/already-failed run is not failed again. Renewal infrastructure failures
+Local cancellation, stalls, and deadlines fail the run normally, enabling retry
+and releasing local capacity. Renewal continues during cooperative cleanup unless
+ownership is lost. A known database cancelled/already-failed run is not failed
+again. Renewal infrastructure failures
 abandon the local lease for database recovery and return an error; the SDK does
 not continue executing indefinitely under uncertain ownership. Renewal queries
 are bounded by a locally tracked lease deadline. This is a conservative local
@@ -181,7 +199,8 @@ stream of successive events. Missing timeout payloads and JSON null payloads
 remain distinguishable.
 
 `await_task_result` and its named variant poll another queue while retaining a
-worker slot. They heartbeat when no background supervisor is renewing the claim.
+worker slot. They explicitly heartbeat to maintain the claim and report continued
+application activity, even when a background supervisor is also renewing it.
 A terminal raw snapshot is checkpointed before decoding, including failed and
 cancelled child states. Replay survives child retention cleanup. JSON null
 results are preserved distinctly from absent results.

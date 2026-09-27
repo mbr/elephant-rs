@@ -15,7 +15,7 @@ use elephant::{
     client::Client,
     context::Step,
     error::Error,
-    run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions},
+    run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions, StallTimeout},
     schema,
     task::{Router, Task},
     types::{
@@ -1108,6 +1108,210 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
         .await?;
 
     assert_eq!(result, Output { value: 40 });
+    Ok(())
+}
+
+/// Verifies that default supervision retries a hung task and releases worker capacity.
+#[tokio::test]
+async fn default_stall_recovery_retries_and_releases_capacity() -> TestResult {
+    let test = setup().await?;
+    let started = Arc::new(Notify::new());
+    let task_started = started.clone();
+    let task = Task::<Input, Output>::builder("stall")?
+        .default_max_attempts(2)
+        .handler(move |context, input| {
+            let started = task_started.clone();
+            async move {
+                if input.value == 0 && context.metadata().attempt == 1 {
+                    started.notify_one();
+                    return std::future::pending().await;
+                }
+                Ok(Output { value: input.value })
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let stalled = test.client.spawn(&task, Input { value: 0 }).send().await?;
+    let shutdown = CancellationToken::new();
+    let worker_shutdown = shutdown.clone();
+    let client = test.client.clone();
+    let mut worker = tokio::spawn(async move {
+        client
+            .worker(router)
+            .claim_timeout(Duration::from_secs(1))
+            .run(worker_shutdown)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified()).await?;
+    let next = test.client.spawn(&task, Input { value: 9 }).send().await?;
+    let next_result = next
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await;
+    let retried = stalled
+        .await_result(&test.client, Some(Duration::from_secs(5)))
+        .await;
+    shutdown.cancel();
+    let joined = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+    if joined.is_err() {
+        worker.abort();
+        let _ = worker.await;
+    }
+    joined?.expect("worker should join")?;
+    assert_eq!(next_result?, Output { value: 9 });
+    assert_eq!(retried?, Output { value: 0 });
+    let failure: serde_json::Value =
+        sqlx::query_scalar("SELECT failure_reason FROM absurd.r_default WHERE run_id = $1")
+            .bind(stalled.result.run_id.as_uuid())
+            .fetch_one(test.client.pool())
+            .await?;
+    assert_eq!(
+        failure["message"],
+        "execution stalled without checkpoint or heartbeat progress"
+    );
+    Ok(())
+}
+
+/// Verifies that checkpoint writes and explicit heartbeats independently prevent stalls.
+#[tokio::test]
+async fn application_progress_resets_default_stall_deadline() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<i32, ()>::builder("progress")?
+        .default_max_attempts(1)
+        .handler(|context, kind| async move {
+            if kind == 2 {
+                context.heartbeat(Duration::from_millis(1100)).await?;
+                tokio::time::sleep(Duration::from_millis(1400)).await;
+                return Ok(());
+            }
+            for i in 0..4 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let context = context.clone();
+                if kind == 1 {
+                    context.heartbeat(Duration::from_secs(1)).await?;
+                } else {
+                    context.step("progress", || async { Ok(i) }).await?;
+                }
+            }
+            Ok(())
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let checkpointed = test.client.spawn(&task, 0).send().await?;
+    let heartbeating = test.client.spawn(&task, 1).send().await?;
+    let extended = test.client.spawn(&task, 2).send().await?;
+    let leases = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                claim_timeout: Duration::from_secs(1),
+                batch_size: 3,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(leases.len(), 3);
+    futures::future::try_join_all(
+        leases
+            .into_iter()
+            .map(|lease| router.dispatch_with(lease, ExecutionOptions::default())),
+    )
+    .await?;
+    for spawned in [checkpointed, heartbeating, extended] {
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Verifies that applications can select or explicitly disable the inactivity window.
+#[tokio::test]
+async fn stall_policy_can_be_overridden() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("stall-policy")?
+        .default_max_attempts(1)
+        .handler(|_, ()| async {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            Ok(())
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    for (stall_timeout, expected) in [
+        (
+            StallTimeout::After(Duration::from_millis(50)),
+            TaskResultState::Failed,
+        ),
+        (StallTimeout::Disabled, TaskResultState::Completed),
+    ] {
+        let spawned = test.client.spawn(&task, ()).send().await?;
+        let lease = test
+            .client
+            .claim_task(
+                "default",
+                &elephant::worker::ClaimOptions {
+                    claim_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .pop()
+            .expect("task should be claimable");
+        router
+            .dispatch_with(
+                lease,
+                ExecutionOptions {
+                    stall_timeout,
+                    cancellation_grace: Duration::ZERO,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            test.client
+                .fetch_task_result("default", spawned.result.task_id.as_uuid())
+                .await?
+                .expect("task should exist")
+                .state,
+            expected
+        );
+    }
+    Ok(())
+}
+
+/// Verifies that blocked terminal persistence cannot stall supervised dispatch.
+#[tokio::test]
+async fn run_resolution_is_bounded_when_database_rows_are_locked() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("blocked-completion")?
+        .handler(|_, ()| async { Ok(()) })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let lease = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                claim_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("task should be claimable");
+    let mut lock = test.client.pool().begin().await?;
+    sqlx::query("SELECT task_id FROM absurd.t_default WHERE task_id = $1 FOR UPDATE")
+        .bind(spawned.result.task_id.as_uuid())
+        .fetch_one(&mut *lock)
+        .await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        router.dispatch_with(lease, ExecutionOptions::default()),
+    )
+    .await;
+    lock.rollback().await?;
+    assert!(matches!(result?, Err(Error::RunResolutionTimeout)));
     Ok(())
 }
 

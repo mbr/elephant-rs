@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     client::Client,
     error::{Error, Result},
-    run::ClaimedRun,
+    run::{ClaimedRun, ExecutionActivity},
     types::{EventName, QueueName, RunId, Spawned, StepName, TaskId, TaskName, TaskResultSnapshot},
 };
 
@@ -49,8 +49,8 @@ pub struct TaskContext {
     claim_timeout: Duration,
     /// Signals that supervised execution is stopping.
     cancellation: CancellationToken,
-    /// Indicates that the dispatch supervisor owns background renewal.
-    renewed_in_background: bool,
+    /// Reports successful application progress to the dispatch supervisor.
+    activity: Option<ExecutionActivity>,
     /// Caches visible checkpoint payloads.
     checkpoints: Arc<Mutex<HashMap<String, Value>>>,
     /// Counts each base name's occurrences within this execution.
@@ -74,7 +74,7 @@ impl TaskContext {
             }),
             claim_timeout: run.claim_timeout,
             cancellation: CancellationToken::new(),
-            renewed_in_background: false,
+            activity: None,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
             checkpoint_counts: Arc::default(),
             checkpoint_extend_by: Some(run.claim_timeout),
@@ -85,10 +85,10 @@ impl TaskContext {
     pub(crate) fn with_supervision(
         mut self,
         cancellation: CancellationToken,
-        renewed_in_background: bool,
+        activity: ExecutionActivity,
     ) -> Self {
         self.cancellation = cancellation;
-        self.renewed_in_background = renewed_in_background;
+        self.activity = Some(activity);
         self
     }
 
@@ -260,6 +260,7 @@ impl TaskContext {
             None => return Err(Error::EventTimeout),
         };
         self.insert_checkpoint(step_name.as_str(), payload.clone());
+        self.record_progress(None);
         serde_json::from_value(payload).map_err(Error::json)
     }
 
@@ -282,7 +283,9 @@ impl TaskContext {
                 self.metadata.run_id.as_uuid(),
                 extend_by,
             )
-            .await
+            .await?;
+        self.record_progress(Some(extend_by));
+        Ok(())
     }
 
     /// Durably observes a spawned task result from a different queue.
@@ -332,7 +335,7 @@ impl TaskContext {
                 loop {
                     tokio::select! {
                         result = &mut wait => return result,
-                        _ = heartbeat.tick(), if !self.renewed_in_background => self.heartbeat(self.claim_timeout).await?,
+                        _ = heartbeat.tick() => self.heartbeat(self.claim_timeout).await?,
                     }
                 }
             })
@@ -352,6 +355,11 @@ impl TaskContext {
     /// Persists a durable sleep checkpoint.
     async fn persist_sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<()> {
         let payload = serde_json::to_value(wake_at).map_err(Error::json)?;
+        self.persist_checkpoint(step_name, payload).await
+    }
+
+    /// Persists and caches a checkpoint before reporting application progress.
+    async fn persist_checkpoint(&self, step_name: &str, payload: Value) -> Result<()> {
         self.client
             .set_checkpoint(
                 self.metadata.queue_name.as_str(),
@@ -363,6 +371,7 @@ impl TaskContext {
             )
             .await?;
         self.insert_checkpoint(step_name, payload);
+        self.record_progress(self.checkpoint_extend_by);
         Ok(())
     }
 
@@ -413,6 +422,13 @@ impl TaskContext {
             .lock()
             .expect("checkpoint cache lock poisoned");
         guard.insert(step_name.to_string(), value);
+    }
+
+    /// Notifies supervision after successful writes or explicit heartbeats.
+    fn record_progress(&self, extend_by: Option<Duration>) {
+        if let Some(activity) = &self.activity {
+            activity.record(extend_by);
+        }
     }
 }
 
@@ -468,18 +484,8 @@ where
     pub async fn complete(self, value: T) -> Result<T> {
         let payload = serde_json::to_value(&value).map_err(Error::json)?;
         self.context
-            .client
-            .set_checkpoint(
-                self.context.metadata.queue_name.as_str(),
-                self.context.metadata.task_id.as_uuid(),
-                self.step_name.as_str(),
-                &payload,
-                self.context.metadata.run_id.as_uuid(),
-                self.context.checkpoint_extend_by,
-            )
+            .persist_checkpoint(self.step_name.as_str(), payload)
             .await?;
-        self.context
-            .insert_checkpoint(self.step_name.as_str(), payload);
         Ok(value)
     }
 }

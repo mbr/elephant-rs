@@ -314,7 +314,7 @@ impl Router {
         };
         let cancellation = CancellationToken::new();
         let context_cancellation = cancellation.clone();
-        let renewed_in_background = !matches!(&options.lease_renewal, LeaseRenewal::Disabled);
+        let activity = lease.activity();
         let wrapper = self.execution_wrapper.clone();
         let execute = async move {
             let checkpoints = client
@@ -327,7 +327,7 @@ impl Router {
                 .into_iter()
                 .collect();
             let context = TaskContext::new(client, &run, checkpoints)
-                .with_supervision(context_cancellation, renewed_in_background);
+                .with_supervision(context_cancellation, activity);
             let wrapped_context = context.clone();
             let execute = async move { (task.handler)(context, run.params).await }.boxed();
             match wrapper {

@@ -132,11 +132,11 @@ the application supervisor. Handler failures are recorded for database retry.
 
 `Router::dispatch_with` and `RunLease::run_supervised` expose the same supervision
 used by workers. `run::ExecutionOptions` selects automatic, custom, or disabled
-background renewal, an optional per-dispatch deadline, and a cancellation grace
-period. Automatic renewal uses the actual claimed lease duration and local
-request start, accounting for time buffered before dispatch. Locally expired
-claims are rejected before the handler starts. The deadline
-covers one dispatch, not the entire durable workflow across sleeps and retries.
+background renewal, stalled-task recovery, an optional total dispatch deadline,
+and a cancellation grace period. Automatic renewal uses the actual claimed
+lease duration and local request start, accounting for time buffered before
+dispatch. Locally expired claims are rejected before the handler starts. The
+deadline covers one dispatch, not the workflow across sleeps and retries.
 
 `TaskContext::cancellation_token()` signals cooperative cleanup. Detected lease
 cancellation/failure, renewal errors, and execution deadlines signal this token;
@@ -146,20 +146,44 @@ not failed again. Renewal infrastructure errors abandon the lease for database
 recovery and return an error. A renewal request is bounded by the locally known
 lease deadline; it cannot hang indefinitely while work continues unprotected.
 
+By default, `StallTimeout::ClaimDuration` cancels a dispatch that makes no
+application progress within its lease window (initially the claimed duration,
+30 seconds by default). Successful checkpoint writes and explicit
+`TaskContext::heartbeat` calls reset this window to the requested effective
+lease duration. Successful event checkpoint writes also count as progress;
+child-result polling performs explicit heartbeats. Cached reads, failed writes,
+raw client calls, and automatic background renewal do not reset it.
+
+A stalled handler receives cancellation, then is dropped after the grace period.
+Background renewal continues during cleanup unless ownership is lost. The run
+is failed normally, allowing database retry and releasing worker capacity. A
+late success or heartbeat cannot rescue an already interrupted dispatch.
+Terminal persistence has a separate claim-duration budget, so a blocked
+completion/failure query cannot hold worker capacity indefinitely. Its timeout
+returns `Error::RunResolutionTimeout`; the database outcome may be uncertain,
+so it does not imply that a write was rolled back.
+
+Use `.stall_timeout(duration)` or `StallTimeout::After(duration)` for a fixed
+inactivity window. `StallTimeout::Disabled` explicitly opts into potentially
+unbounded renewal; an overall `timeout` can still bound the dispatch. The overall
+timeout is never reset by progress. Raw `RunLease::run_supervised` futures without
+a routed context have no context progress notifications and remain bounded by
+their initial stall window unless configured otherwise.
+
 Blocking code cannot be preempted by an async deadline, and dropping a future
 does not undo external effects or stop detached tasks. Handlers must cooperate,
 avoid detached work, and use idempotency keys. The SDK never terminates the
-process. There is no execution deadline by default; configure one for work that
-must not renew forever.
+process; blocking or native-code hangs require an external process supervisor.
 
 ```rust,no_run
-use elephant::{client::Client, run::ExecutionOptions, task::Router, worker::ClaimOptions};
+use elephant::{client::Client, run::{ExecutionOptions, StallTimeout}, task::Router, worker::ClaimOptions};
 use futures::StreamExt;
 use std::time::Duration;
 
 # async fn example(client: Client, router: Router) -> elephant::error::Result<()> {
 let options = ExecutionOptions {
     timeout: Some(Duration::from_secs(300)),
+    stall_timeout: StallTimeout::After(Duration::from_secs(60)),
     cancellation_grace: Duration::from_secs(2),
     ..Default::default()
 };
@@ -172,10 +196,11 @@ while let Some(lease) = claims.next().await {
 ```
 
 For workers, use `.execution(options)`, or `.execution_timeout(duration)` and
-`.cancellation_grace(duration)`. Bare `Router::dispatch` and `work_batch` do not
-renew in the background or impose a deadline. Checkpoint writes and durable
-child-result polling still renew their claims. Manual streams can buffer an
-already-claimed batch: keep the batch within your immediately available
+`.cancellation_grace(duration)`. Bare `Router::dispatch` and `work_batch` enforce
+the default stall policy but do not renew in the background. Checkpoint writes
+and durable child-result polling still renew their claims. `RunLease::run` is the
+explicitly unsupervised primitive. Manual streams can buffer an already-claimed
+batch: keep the batch within your immediately available
 capacity, and do not abandon in-flight claim queries during shutdown.
 
 ## Sleeps and events

@@ -35,6 +35,12 @@ pub enum Error {
     /// Indicates that the per-dispatch execution deadline expired.
     #[error("execution deadline expired")]
     ExecutionTimedOut,
+    /// Indicates that application progress stopped for the inactivity window.
+    #[error("execution stalled without checkpoint or heartbeat progress")]
+    ExecutionStalled,
+    /// Indicates that terminal persistence exceeded the resolution budget.
+    #[error("run resolution exceeded the claim-duration budget")]
+    RunResolutionTimeout,
     /// Indicates that execution supervision was configured inconsistently.
     #[error("invalid execution options: {reason}")]
     InvalidExecutionOptions {

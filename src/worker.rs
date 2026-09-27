@@ -10,7 +10,10 @@ use tracing::warn;
 use crate::{
     client::Client,
     error::{Error, Result},
-    run::{DEFAULT_CLAIM_TIMEOUT, ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions, RunLease},
+    run::{
+        DEFAULT_CLAIM_TIMEOUT, ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions, RunLease,
+        StallTimeout,
+    },
     task::Router,
 };
 
@@ -192,6 +195,12 @@ impl WorkerBuilder {
         self
     }
 
+    /// Sets the inactivity window without changing the overall execution deadline.
+    pub fn stall_timeout(mut self, timeout: Duration) -> Self {
+        self.options.execution.stall_timeout = StallTimeout::After(timeout);
+        self
+    }
+
     /// Sets the cooperative cleanup period after execution interruption.
     pub fn cancellation_grace(mut self, grace: Duration) -> Self {
         self.options.execution.cancellation_grace = grace;
@@ -322,7 +331,7 @@ mod tests {
     use crate::{
         client::Client,
         error::Error,
-        run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions},
+        run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions, StallTimeout},
         task::Router,
     };
 
@@ -351,6 +360,13 @@ mod tests {
                         interval: Duration::ZERO,
                         extend_by: Duration::from_secs(1),
                     }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            WorkerOptions {
+                execution: ExecutionOptions {
+                    stall_timeout: StallTimeout::After(Duration::ZERO),
                     ..Default::default()
                 },
                 ..Default::default()
