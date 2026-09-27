@@ -598,7 +598,13 @@ async fn synchronous_panic_becomes_failed_task_result() -> TestResult {
         .await?;
 
     assert_eq!(snapshot.state, TaskResultState::Failed);
-    assert!(snapshot.failure.is_some());
+    assert_eq!(
+        snapshot
+            .failure
+            .as_ref()
+            .expect("panic should have diagnostics")["message"],
+        "intentional synchronous panic"
+    );
     Ok(())
 }
 
