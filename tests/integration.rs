@@ -1062,6 +1062,44 @@ async fn execution_deadlines_resolve_manual_dispatch() -> TestResult {
     Ok(())
 }
 
+/// Verifies that buffered claims are not given a fresh lease at dispatch time.
+#[tokio::test]
+async fn expired_buffered_claim_does_not_start_execution() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .spawn_untyped("expired", Input { value: 0 }, SpawnOptions::default())
+        .await?;
+    let lease = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                claim_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("task should be claimable");
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let calls = AtomicUsize::new(0);
+    let cancellation = CancellationToken::new();
+    let result = lease
+        .run_supervised(
+            async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            ExecutionOptions::default(),
+            cancellation.clone(),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::LeaseRenewalTimeout)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(cancellation.is_cancelled());
+    Ok(())
+}
+
 /// Verifies that a stalled renewal cannot outlive the local claim deadline.
 #[tokio::test]
 async fn stalled_renewal_is_bounded_by_claim_deadline() -> TestResult {
