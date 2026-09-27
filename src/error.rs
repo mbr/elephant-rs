@@ -13,7 +13,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Represents errors returned by Elephant operations.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Indicates that Absurd cancelled the task.
+    /// Indicates that an operation's owning task was cancelled by Absurd.
+    ///
+    /// Dispatch treats this as control flow for the active run, not as an
+    /// ordinary handler failure. Task result inspection uses [`Self::TaskCancelled`].
     #[error("task was cancelled")]
     Cancelled,
     /// Indicates that a duration cannot be represented for Absurd.
@@ -100,6 +103,12 @@ pub enum Error {
     /// Indicates that a task run suspended itself.
     #[error("task run suspended")]
     Suspended,
+    /// Indicates that an inspected task finished by cancellation.
+    #[error("task {task_id} was cancelled")]
+    TaskCancelled {
+        /// Identifies the cancelled task, which need not be the active task.
+        task_id: crate::types::TaskId,
+    },
     /// Indicates that a task does not exist in the selected queue.
     #[error("task {task_id} was not found")]
     TaskNotFound {

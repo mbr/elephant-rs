@@ -694,7 +694,7 @@ impl TaskResultSnapshot {
                     task_id: task_id.as_uuid(),
                 }),
             },
-            TaskResultState::Cancelled => Err(Error::Cancelled),
+            TaskResultState::Cancelled => Err(Error::TaskCancelled { task_id }),
             TaskResultState::Failed => Err(Error::TaskFailed {
                 task_id: task_id.as_uuid(),
                 failure: self.failure.clone(),
