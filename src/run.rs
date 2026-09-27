@@ -233,6 +233,11 @@ impl RunLease {
         let stop = tokio::select! {
             result = &mut future => {
                 drop(future);
+                let result = if cancellation.is_cancelled() {
+                    Err(Error::ExecutionCancelled)
+                } else {
+                    result
+                };
                 return self.run(async { result }).await;
             }
             _ = cancellation.cancelled() => ExecutionStop::Cancelled,
