@@ -251,13 +251,6 @@ including repeated names, sleeps, events, and child snapshots. Cross-language
 workflows must still agree on names, call order, and application JSON schemas.
 For Rust's unnamed sleep helpers, use `sleep` as the name in other SDKs.
 
-**Upgrade from earlier Elephant snapshots:** those used exact-name reuse,
-`{wake_at: ...}` sleep objects, and `event:` defaults. This is a breaking replay
-change. Drain existing workflows with the old SDK before upgrading, or migrate
-checkpoints with application-specific knowledge. Do not mix old and new workers
-for those task types; automatic format detection cannot recover the intended
-meaning of old repeated-name workflows.
-
 ## Execution instrumentation
 
 Every router dispatch has a `tracing` span carrying queue, task ID, run ID,

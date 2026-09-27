@@ -237,12 +237,6 @@ Rust writes. The pinned generator also verifies Go replay. Applications must
 still agree on names, call order, and JSON schemas across languages; these are
 workflow contracts, not properties guaranteed by the shared SQL schema.
 
-Earlier Elephant snapshots used exact-name reuse, object-shaped sleeps, and
-`event:` defaults. Upgrading these executions requires draining them under the
-old implementation or an application-specific migration. Do not concurrently
-route them to old and new implementations. Auto-detection cannot infer missing
-occurrences or the intended side effects of an old repeated-name workflow.
-
 ## Errors, panics, and instrumentation
 
 Owning-run SQLSTATE `AB001` maps to `Error::Cancelled`; `AB002` maps to
