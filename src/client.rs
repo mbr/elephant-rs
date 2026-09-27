@@ -5,7 +5,7 @@ use std::{marker::PhantomData, str::FromStr, time::Duration};
 use jiff::Timestamp;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use sqlx::{PgPool, Row, types::Json};
+use sqlx::{PgConnection, PgPool, Row, types::Json};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -192,6 +192,21 @@ impl Client {
         params: P,
         options: SpawnOptions,
     ) -> Result<SpawnResult> {
+        let mut connection = self.pool.acquire().await?;
+        self.spawn_untyped_on(&mut connection, task_name, params, options)
+            .await
+    }
+
+    /// Spawns an untyped task using the caller's connection or transaction.
+    ///
+    /// The caller owns transaction boundaries; this method never commits.
+    pub async fn spawn_untyped_on<P: Serialize>(
+        &self,
+        connection: &mut PgConnection,
+        task_name: impl AsRef<str>,
+        params: P,
+        options: SpawnOptions,
+    ) -> Result<SpawnResult> {
         let task_name = TaskName::from_str(task_name.as_ref())?;
         let queue_name = match options
             .queue_name
@@ -207,7 +222,8 @@ impl Client {
                 });
             }
         };
-        self.spawn_raw(
+        self.spawn_raw_on(
+            connection,
             queue_name,
             task_name,
             params,
@@ -491,6 +507,19 @@ impl Client {
         event_name: impl AsRef<str>,
         payload: T,
     ) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        self.emit_event_on(&mut connection, queue_name, event_name, payload)
+            .await
+    }
+
+    /// Emits an event using the caller's connection without committing it.
+    pub async fn emit_event_on<T: Serialize>(
+        &self,
+        connection: &mut PgConnection,
+        queue_name: impl AsRef<str>,
+        event_name: impl AsRef<str>,
+        payload: T,
+    ) -> Result<()> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
         let event_name = EventName::from_str(event_name.as_ref())?;
         let payload = serde_json::to_value(payload).map_err(Error::json)?;
@@ -498,7 +527,7 @@ impl Client {
             .bind(queue_name.as_str())
             .bind(event_name.as_str())
             .bind(Json(payload))
-            .execute(&self.pool)
+            .execute(connection)
             .await
             .map_err(Error::from_sqlx)?;
         Ok(())
@@ -667,8 +696,9 @@ impl Client {
     }
 
     /// Spawns a task with normalized raw data.
-    async fn spawn_raw<P: Serialize>(
+    async fn spawn_raw_on<P: Serialize>(
         &self,
+        connection: &mut PgConnection,
         queue_name: QueueName,
         task_name: TaskName,
         params: P,
@@ -682,7 +712,7 @@ impl Client {
             .bind(task_name.as_str())
             .bind(Json(params))
             .bind(Json(options))
-            .fetch_one(&self.pool)
+            .fetch_one(connection)
             .await
             .map_err(Error::from_sqlx)?;
         row_to_spawn_result(row)
@@ -795,7 +825,15 @@ where
     }
 
     /// Sends the spawn request.
-    pub async fn send(mut self) -> Result<Spawned<R>> {
+    pub async fn send(self) -> Result<Spawned<R>> {
+        let mut connection = self.client.pool.acquire().await?;
+        self.send_on(&mut connection).await
+    }
+
+    /// Sends the spawn request using a caller-owned connection or transaction.
+    ///
+    /// The handle is valid outside the transaction only after a successful commit.
+    pub async fn send_on(mut self, connection: &mut PgConnection) -> Result<Spawned<R>> {
         let queue_name = match self
             .queue_name
             .take()
@@ -816,7 +854,8 @@ where
         }
         let result = self
             .client
-            .spawn_raw(
+            .spawn_raw_on(
+                connection,
                 queue_name.clone(),
                 self.task_name,
                 self.params,

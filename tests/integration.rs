@@ -139,6 +139,86 @@ async fn spawned_task_completes_through_router() -> Result<(), Box<dyn StdError 
     Ok(())
 }
 
+/// Verifies that business writes, task spawning, and events share transactions.
+#[tokio::test]
+async fn enqueue_and_emit_follow_caller_transaction() -> TestResult {
+    let test = setup().await?;
+    sqlx::query("CREATE TABLE business_values (value integer NOT NULL)")
+        .execute(test.client.pool())
+        .await?;
+    let task = Task::<Input, Output>::builder("transactional")?
+        .queue("default")?
+        .handler(|context, _| async move { context.await_event("transaction-event").await })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    for commit in [false, true] {
+        let value = if commit { 42 } else { 1 };
+        let mut transaction = test.client.pool().begin().await?;
+        sqlx::query("INSERT INTO business_values VALUES ($1)")
+            .bind(value)
+            .execute(&mut *transaction)
+            .await?;
+        let spawned = test
+            .client
+            .spawn(&task, Input { value })
+            .idempotency_key("business-value")
+            .send_on(&mut transaction)
+            .await?;
+        test.client
+            .emit_event_on(
+                &mut transaction,
+                "default",
+                "transaction-event",
+                Output { value },
+            )
+            .await?;
+        assert!(
+            test.client
+                .fetch_task_result("default", spawned.result.task_id.as_uuid())
+                .await?
+                .is_none()
+        );
+        if commit {
+            transaction.commit().await?;
+            work_batch(&test.client, &router, "default").await?;
+            assert_eq!(
+                spawned
+                    .await_result(&test.client, Some(Duration::from_secs(1)))
+                    .await?,
+                Output { value: 42 }
+            );
+        } else {
+            let raw = test
+                .client
+                .spawn_untyped_on(
+                    &mut transaction,
+                    "also-rolled-back",
+                    Input { value },
+                    SpawnOptions::default(),
+                )
+                .await?;
+            transaction.rollback().await?;
+            for task_id in [raw.task_id, spawned.result.task_id] {
+                assert!(
+                    test.client
+                        .fetch_task_result("default", task_id.as_uuid())
+                        .await?
+                        .is_none()
+                );
+            }
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM business_values")
+                .fetch_one(test.client.pool())
+                .await?;
+            assert_eq!(count, 0);
+        }
+    }
+    let values: Vec<i32> = sqlx::query_scalar("SELECT value FROM business_values")
+        .fetch_all(test.client.pool())
+        .await?;
+    assert_eq!(values, [42]);
+    Ok(())
+}
+
 /// Verifies that completed checkpoints are replayed after failure.
 #[tokio::test]
 async fn checkpoint_replay_skips_completed_step() -> Result<(), Box<dyn StdError + Send + Sync>> {

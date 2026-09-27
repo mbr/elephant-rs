@@ -55,6 +55,32 @@ let spawned = client.spawn(&task, Params { value: 21 }).send().await?;
 # }
 ```
 
+## Atomic enqueueing
+
+`SpawnBuilder::send_on`, `Client::spawn_untyped_on`, and `Client::emit_event_on`
+accept `&mut sqlx::PgConnection`, including a dereferenced caller-owned
+transaction. They never commit. The pool-backed methods delegate to the same
+implementations. Execution and administrative operations remain pool-backed.
+
+```rust,no_run
+use elephant::{client::Client, task::Task};
+
+# async fn example(client: Client, task: Task<i32, i32>) -> elephant::error::Result<()> {
+let mut transaction = client.pool().begin().await?;
+sqlx::query("UPDATE orders SET status = 'queued' WHERE id = $1")
+    .bind(42)
+    .execute(&mut *transaction)
+    .await?;
+let spawned = client.spawn(&task, 42).send_on(&mut transaction).await?;
+transaction.commit().await?;
+# let _ = spawned;
+# Ok(())
+# }
+```
+
+The task becomes visible to workers only after commit. Do not await its result
+before committing, and do not use a handle from a rolled-back transaction.
+
 ## Manual claim loop
 
 ```rust,no_run
