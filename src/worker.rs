@@ -139,10 +139,14 @@ pub struct WorkerBuilder {
 impl WorkerBuilder {
     /// Creates a worker builder.
     pub fn new(client: Client, router: Router) -> Self {
+        let mut options = WorkerOptions::default();
+        if let Some(queue) = client.default_queue() {
+            options.queue_name = queue.to_string();
+        }
         Self {
             client,
             router,
-            options: WorkerOptions::default(),
+            options,
         }
     }
 

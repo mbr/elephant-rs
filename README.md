@@ -121,7 +121,8 @@ client.worker(router).concurrency(8).run(shutdown).await?;
 # }
 ```
 
-The convenience worker automatically extends active claims. Each claim batch is
+The convenience worker inherits the client's default queue (or `default`) unless
+`.queue(...)` overrides it, and automatically extends active claims. Each claim batch is
 bounded by free execution slots. Shutdown stops new claims and drains both
 issued claim queries and active executions; it does not cancel handlers.
 Infrastructure errors likewise stop claiming, drain active work, and return to
