@@ -560,6 +560,81 @@ async fn queue_policy_round_trips() -> Result<(), Box<dyn StdError + Send + Sync
     Ok(())
 }
 
+/// Verifies that manual dispatch renews its lease while polling a child.
+#[tokio::test]
+async fn child_wait_renews_manual_claim() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .create_queue("children", CreateQueueOptions::default())
+        .await?;
+    let child = Task::<Input, Output>::builder("child")?
+        .queue("children")?
+        .handler(|_, input| async move { Ok(Output { value: input.value }) })
+        .build();
+    let child_router = Router::new().task(child.clone())?;
+    let child = test.client.spawn(&child, Input { value: 7 }).send().await?;
+    let parent = Task::<Input, Output>::builder("parent")?
+        .handler(move |context, _| {
+            let child = child.clone();
+            async move {
+                context
+                    .await_task_result_named("child-result", &child, Some(Duration::from_secs(5)))
+                    .await
+            }
+        })
+        .build();
+    let router = Router::new().task(parent.clone())?;
+    let parent = test
+        .client
+        .spawn(&parent, Input { value: 0 })
+        .send()
+        .await?;
+    let lease = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                claim_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("parent should be claimable");
+    let original_expiry: String =
+        sqlx::query_scalar("SELECT claim_expires_at::text FROM absurd.r_default WHERE run_id = $1")
+            .bind(parent.result.run_id.as_uuid())
+            .fetch_one(test.client.pool())
+            .await?;
+    let dispatch = tokio::spawn(async move { router.dispatch(lease).await });
+    let extended = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let extended: bool = sqlx::query_scalar(
+                "SELECT claim_expires_at > $2::timestamptz FROM absurd.r_default WHERE run_id = $1",
+            )
+            .bind(parent.result.run_id.as_uuid())
+            .bind(&original_expiry)
+            .fetch_one(test.client.pool())
+            .await?;
+            if extended {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    work_batch(&test.client, &child_router, "children").await?;
+    dispatch.await.expect("dispatch should join")?;
+    extended??;
+    assert_eq!(
+        parent
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        Output { value: 7 }
+    );
+    Ok(())
+}
+
 /// Verifies that an observed child result survives cleanup and parent retry.
 #[tokio::test]
 async fn child_result_replays_after_cleanup() -> TestResult {
@@ -652,6 +727,16 @@ async fn cancelled_child_resolves_parent_run() -> TestResult {
         .await?
         .expect("parent should exist");
     assert_eq!(snapshot.state, TaskResultState::Failed);
+    let checkpoints = test
+        .client
+        .get_checkpoints(
+            "default",
+            parent.result.task_id.as_uuid(),
+            parent.result.run_id.as_uuid(),
+        )
+        .await?;
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].1["state"], "cancelled");
     Ok(())
 }
 

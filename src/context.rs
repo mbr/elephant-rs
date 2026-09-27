@@ -11,12 +11,13 @@ use std::{
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use tokio::time::{Instant, interval_at};
 
 use crate::{
     client::Client,
     error::{Error, Result},
     run::ClaimedRun,
-    types::{EventName, QueueName, RunId, Spawned, StepName, TaskId, TaskName},
+    types::{EventName, QueueName, RunId, Spawned, StepName, TaskId, TaskName, TaskResultSnapshot},
 };
 
 /// Carries metadata for an active task run.
@@ -41,6 +42,8 @@ pub struct TaskContext {
     client: Client,
     /// Carries task metadata.
     metadata: TaskMetadata,
+    /// Carries the original lease duration for durable polling waits.
+    claim_timeout: Duration,
     /// Caches visible checkpoint payloads.
     checkpoints: Arc<Mutex<HashMap<String, Value>>>,
     /// Carries the claim extension used by checkpoint writes.
@@ -59,8 +62,9 @@ impl TaskContext {
                 attempt: run.attempt,
                 task_name: run.task_name.clone(),
             },
+            claim_timeout: run.claim_timeout,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
-            checkpoint_extend_by: None,
+            checkpoint_extend_by: Some(run.claim_timeout),
         }
     }
 
@@ -263,7 +267,11 @@ impl TaskContext {
             .await
     }
 
-    /// Awaits a spawned task result from a different queue.
+    /// Durably observes a spawned task result from a different queue.
+    ///
+    /// The terminal snapshot is checkpointed before decoding, including failed
+    /// and cancelled results. Polling occupies a worker slot and renews the
+    /// current claim; it does not suspend the run in PostgreSQL.
     pub async fn await_task_result<R>(
         &self,
         spawned: &Spawned<R>,
@@ -272,17 +280,46 @@ impl TaskContext {
     where
         R: DeserializeOwned,
     {
-        let queue_name = &spawned.queue_name;
-        if queue_name == &self.metadata.queue_name {
+        self.await_task_result_named(
+            format!("$awaitTaskResult:{}", spawned.result.task_id),
+            spawned,
+            timeout,
+        )
+        .await
+    }
+
+    /// Durably observes a child result under an explicit checkpoint name.
+    pub async fn await_task_result_named<R>(
+        &self,
+        step_name: impl AsRef<str>,
+        spawned: &Spawned<R>,
+        timeout: Option<Duration>,
+    ) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
+        if spawned.queue_name == self.metadata.queue_name {
             return Err(Error::SameQueueWait);
         }
-        self.client
-            .await_typed_task_result(
-                queue_name.as_str(),
-                spawned.result.task_id.as_uuid(),
-                timeout,
-            )
-            .await
+        let snapshot: TaskResultSnapshot = self
+            .step(step_name, || async {
+                let wait = self.client.await_task_result(
+                    spawned.queue_name.as_str(),
+                    spawned.result.task_id.as_uuid(),
+                    timeout,
+                );
+                tokio::pin!(wait);
+                let interval = (self.claim_timeout / 3).max(Duration::from_millis(1));
+                let mut heartbeat = interval_at(Instant::now() + interval, interval);
+                loop {
+                    tokio::select! {
+                        result = &mut wait => return result,
+                        _ = heartbeat.tick() => self.heartbeat(self.claim_timeout).await?,
+                    }
+                }
+            })
+            .await?;
+        snapshot.decode_completed(spawned.result.task_id)
     }
 
     /// Creates or reads a durable sleep checkpoint.

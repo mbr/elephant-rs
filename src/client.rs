@@ -249,6 +249,7 @@ impl Client {
                             .map_err(Error::from_sqlx)?,
                     ),
                     attempt: row.try_get("attempt").map_err(Error::from_sqlx)?,
+                    claim_timeout: Duration::from_secs(claim_timeout as u64),
                     task_name: TaskName::from_str(
                         &row.try_get::<String, _>("task_name")
                             .map_err(Error::from_sqlx)?,

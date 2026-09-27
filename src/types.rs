@@ -2,7 +2,7 @@
 
 use std::{fmt, marker::PhantomData, str::FromStr, time::Duration};
 
-use serde::{Serialize, Serializer, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -618,7 +618,8 @@ impl<R> Spawned<R> {
 }
 
 /// Describes a task result state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskResultState {
     /// Indicates a pending task.
     Pending,
@@ -659,13 +660,23 @@ impl From<String> for TaskResultState {
 }
 
 /// Describes a task result snapshot.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TaskResultSnapshot {
     /// Carries the task state.
     pub state: TaskResultState,
-    /// Carries the successful result payload.
+    /// Carries the successful result payload, preserving JSON null as a value.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_payload"
+    )]
     pub result: Option<Value>,
     /// Carries the failure payload.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_payload"
+    )]
     pub failure: Option<Value>,
 }
 
@@ -755,6 +766,13 @@ impl RetryTaskOptions {
     }
 }
 
+/// Distinguishes a present JSON null payload from an absent snapshot field.
+fn deserialize_payload<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
 /// Converts a duration to whole seconds without truncating nonzero fractions.
 fn whole_seconds_ceil(duration: Duration) -> u64 {
     duration
@@ -789,8 +807,24 @@ mod tests {
 
     use crate::types::{
         CancellationPolicy, MAX_QUEUE_NAME_BYTES, PgInterval, QueueName, RetryStrategy,
-        SpawnOptions, TaskName,
+        SpawnOptions, TaskName, TaskResultSnapshot, TaskResultState,
     };
+
+    /// Preserves unit results distinctly from missing results in checkpoints.
+    #[test]
+    fn snapshots_preserve_json_null() {
+        for result in [None, Some(serde_json::Value::Null)] {
+            let snapshot = TaskResultSnapshot {
+                state: TaskResultState::Completed,
+                result,
+                failure: None,
+            };
+            let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+            let decoded: TaskResultSnapshot =
+                serde_json::from_value(encoded).expect("snapshot should decode");
+            assert_eq!(decoded, snapshot);
+        }
+    }
 
     #[test]
     fn names_validate_basic_constraints() {

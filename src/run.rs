@@ -24,6 +24,8 @@ pub struct ClaimedRun {
     pub task_id: TaskId,
     /// Carries the attempt number.
     pub attempt: i32,
+    /// Carries the effective lease duration requested when claiming this run.
+    pub claim_timeout: Duration,
     /// Names the task handler.
     pub task_name: TaskName,
     /// Carries the raw parameter payload.
