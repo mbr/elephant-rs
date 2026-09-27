@@ -41,19 +41,31 @@ client.create_queue("default", CreateQueueOptions::default()).await?;
 
 let task = Task::<Params, Output>::builder("double")?
     .queue("default")?
-    .handler(|context, params| async move {
+    .build();
+let router = Router::new().task(task.handler(|context, params| async move {
         let value = context
             .step("double-v1", || async move { Ok(params.value * 2) })
             .await?;
         Ok(Output { value })
-    })
-    .build();
-let router = Router::new().task(task.clone())?;
+    }))?;
 let spawned = client.spawn(&task, Params { value: 21 }).send().await?;
 # let _ = (router, spawned);
 # Ok(())
 # }
 ```
+
+`Task<P, R>` is a producer-facing contract: its builder does not require a
+handler. Put contracts and JSON types in a shared application module or crate;
+workers bind implementations with `task.handler(...)` to obtain a
+`TaskRegistration<P, R>` for the router. The combined
+`Task::builder(...).handler(...).build()` form remains available when producer
+and worker live together.
+
+Task IDs, run IDs, and `Spawned<R>` handles support `serde`. Handles serialize
+only their queue and identifiers, not `R`, and can be stored in durable steps.
+Deserialized names are validated. Use a stable idempotency key when spawning a
+child inside a step: a crash can occur between spawning and checkpointing its
+handle.
 
 ## Atomic enqueueing
 

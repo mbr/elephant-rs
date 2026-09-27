@@ -722,14 +722,14 @@ async fn child_result_replays_after_cleanup() -> TestResult {
     test.client
         .create_queue("children", CreateQueueOptions::default())
         .await?;
-    let child = Task::<Input, Output>::builder("child")?
+    let contract = Task::<Input, Output>::builder("child")?
         .queue("children")?
-        .handler(|_, input| async move { Ok(Output { value: input.value }) })
         .build();
-    let child_router = Router::new().task(child.clone())?;
+    let child_router = Router::new()
+        .task(contract.handler(|_, input| async move { Ok(Output { value: input.value }) }))?;
     let child = test
         .client
-        .spawn(&child, Input { value: 42 })
+        .spawn(&contract, Input { value: 42 })
         .send()
         .await?;
     work_batch(&test.client, &child_router, "children").await?;
@@ -738,6 +738,9 @@ async fn child_result_replays_after_cleanup() -> TestResult {
         .handler(move |context, _| {
             let child = child.clone();
             async move {
+                let child = context
+                    .step("child-reference", || async { Ok(child) })
+                    .await?;
                 let result = context.await_task_result(&child, None).await?;
                 if context.metadata().attempt == 1 {
                     return Err(Error::handler(Box::new(TestFailure)));

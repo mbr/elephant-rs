@@ -12,8 +12,18 @@ use crate::error::{Error, Result};
 pub const MAX_QUEUE_NAME_BYTES: usize = 57;
 
 /// Represents a validated queue name.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(try_from = "String")]
 pub struct QueueName(String);
+
+impl TryFrom<String> for QueueName {
+    /// Validates a deserialized queue name.
+    type Error = Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
 
 impl QueueName {
     /// Returns the queue name as a string slice.
@@ -51,8 +61,18 @@ impl AsRef<str> for QueueName {
 }
 
 /// Represents a validated task name.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(try_from = "String")]
 pub struct TaskName(String);
+
+impl TryFrom<String> for TaskName {
+    /// Validates a deserialized task name.
+    type Error = Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
 
 impl TaskName {
     /// Returns the task name as a string slice.
@@ -90,8 +110,18 @@ impl AsRef<str> for TaskName {
 }
 
 /// Represents a validated step name.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(try_from = "String")]
 pub struct StepName(String);
+
+impl TryFrom<String> for StepName {
+    /// Validates a deserialized checkpoint name.
+    type Error = Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
 
 impl StepName {
     /// Returns the step name as a string slice.
@@ -124,8 +154,18 @@ impl AsRef<str> for StepName {
 }
 
 /// Represents a validated event name.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(try_from = "String")]
 pub struct EventName(String);
+
+impl TryFrom<String> for EventName {
+    /// Validates a deserialized event name.
+    type Error = Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
 
 impl EventName {
     /// Returns the event name as a string slice.
@@ -158,7 +198,8 @@ impl AsRef<str> for EventName {
 }
 
 /// Represents a task identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct TaskId(Uuid);
 
 impl TaskId {
@@ -199,7 +240,8 @@ impl fmt::Display for TaskId {
 }
 
 /// Represents a run identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct RunId(Uuid);
 
 impl RunId {
@@ -583,7 +625,7 @@ impl SpawnOptions {
 }
 
 /// Describes the result of spawning a task.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SpawnResult {
     /// Identifies the task.
     pub task_id: TaskId,
@@ -596,14 +638,23 @@ pub struct SpawnResult {
 }
 
 /// Represents a typed spawned task handle.
-#[derive(Clone, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(bound = "")]
 pub struct Spawned<R> {
     /// Names the queue containing the task.
     pub queue_name: QueueName,
     /// Carries the untyped spawn result.
     pub result: SpawnResult,
     /// Carries the result type marker.
-    pub marker: PhantomData<R>,
+    #[serde(skip)]
+    marker: PhantomData<fn() -> R>,
+}
+
+impl<R> Clone for Spawned<R> {
+    /// Clones the reference without requiring the task result to be cloneable.
+    fn clone(&self) -> Self {
+        Self::new(self.queue_name.clone(), self.result)
+    }
 }
 
 impl<R> Spawned<R> {
@@ -806,9 +857,34 @@ mod tests {
     use std::time::Duration;
 
     use crate::types::{
-        CancellationPolicy, MAX_QUEUE_NAME_BYTES, PgInterval, QueueName, RetryStrategy,
-        SpawnOptions, TaskName, TaskResultSnapshot, TaskResultState,
+        CancellationPolicy, MAX_QUEUE_NAME_BYTES, PgInterval, QueueName, RetryStrategy, RunId,
+        SpawnOptions, SpawnResult, Spawned, TaskId, TaskName, TaskResultSnapshot, TaskResultState,
     };
+
+    /// Round-trips typed references without serializing their result type.
+    #[test]
+    fn handles_serialize_and_validate_names() {
+        /// Represents a result without serialization or clone implementations.
+        struct ResultType;
+
+        let handle = Spawned::<ResultType>::new(
+            "default".parse().expect("valid queue"),
+            SpawnResult {
+                task_id: TaskId::from(uuid::Uuid::nil()),
+                run_id: RunId::from(uuid::Uuid::nil()),
+                attempt: 1,
+                created: true,
+            },
+        );
+        let mut encoded = serde_json::to_value(handle.clone()).expect("handle should serialize");
+        let decoded: Spawned<ResultType> =
+            serde_json::from_value(encoded.clone()).expect("handle should decode");
+        assert_eq!(decoded.result, handle.result);
+        assert_eq!(decoded.queue_name, handle.queue_name);
+        assert!(encoded.get("marker").is_none());
+        encoded["queue_name"] = serde_json::json!("");
+        assert!(serde_json::from_value::<Spawned<ResultType>>(encoded).is_err());
+    }
 
     /// Preserves unit results distinctly from missing results in checkpoints.
     #[test]
