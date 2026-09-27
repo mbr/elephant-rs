@@ -1146,6 +1146,35 @@ async fn cancelled_lease_stops_handler() -> TestResult {
     Ok(())
 }
 
+/// Verifies that a convenience worker inherits its client's default queue.
+#[tokio::test]
+async fn worker_uses_client_default_queue() -> TestResult {
+    let test = setup().await?;
+    let mut builder = Client::builder(test.client.pool().clone());
+    builder.default_queue("workers")?;
+    let client = builder.build();
+    client
+        .create_queue("workers", CreateQueueOptions::default())
+        .await?;
+    let task = Task::<Input, Output>::builder("default-queue")?
+        .handler(|_, input| async move { Ok(Output { value: input.value }) })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = client.spawn(&task, Input { value: 9 }).send().await?;
+    let shutdown = CancellationToken::new();
+    let worker_shutdown = shutdown.clone();
+    let worker_client = client.clone();
+    let worker =
+        tokio::spawn(async move { worker_client.worker(router).run(worker_shutdown).await });
+    let result = spawned
+        .await_result(&client, Some(Duration::from_secs(1)))
+        .await;
+    shutdown.cancel();
+    worker.await.expect("worker should join")?;
+    assert_eq!(result?, Output { value: 9 });
+    Ok(())
+}
+
 /// Verifies that spare capacity does not prevent execution or completion.
 #[tokio::test]
 async fn worker_executes_below_capacity() -> TestResult {
