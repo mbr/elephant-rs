@@ -982,6 +982,29 @@ async fn explicit_event_wait_names_can_repeat_event() -> Result<(), Box<dyn StdE
     Ok(())
 }
 
+/// Verifies that local cancellation cannot be overwritten by a late success.
+#[tokio::test]
+async fn local_cancellation_wins_over_handler_success() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<Input, Output>::builder("local-cancel")?
+        .default_max_attempts(1)
+        .handler(|context, _| async move {
+            context.cancellation_token().cancel();
+            Ok(Output { value: 1 })
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, Input { value: 0 }).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    let snapshot = test
+        .client
+        .fetch_task_result("default", spawned.result.task_id.as_uuid())
+        .await?
+        .expect("cancelled execution should exist");
+    assert_eq!(snapshot.state, TaskResultState::Failed);
+    Ok(())
+}
+
 /// Verifies deadlines signal cleanup and fail even noncooperative dispatches.
 #[tokio::test]
 async fn execution_deadlines_resolve_manual_dispatch() -> TestResult {
