@@ -33,6 +33,8 @@ pub struct TaskMetadata {
     pub attempt: i32,
     /// Names the task.
     pub task_name: TaskName,
+    /// Carries application headers without interpreting or logging their content.
+    pub headers: Option<Value>,
 }
 
 /// Provides durable capabilities to a task handler.
@@ -41,7 +43,7 @@ pub struct TaskContext {
     /// Holds the client.
     client: Client,
     /// Carries task metadata.
-    metadata: TaskMetadata,
+    metadata: Arc<TaskMetadata>,
     /// Carries the original lease duration for durable polling waits.
     claim_timeout: Duration,
     /// Caches visible checkpoint payloads.
@@ -55,13 +57,14 @@ impl TaskContext {
     pub fn new(client: Client, run: &ClaimedRun, checkpoints: HashMap<String, Value>) -> Self {
         Self {
             client,
-            metadata: TaskMetadata {
+            metadata: Arc::new(TaskMetadata {
                 queue_name: run.queue_name.clone(),
                 task_id: run.task_id,
                 run_id: run.run_id,
                 attempt: run.attempt,
                 task_name: run.task_name.clone(),
-            },
+                headers: run.headers.clone(),
+            }),
             claim_timeout: run.claim_timeout,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
             checkpoint_extend_by: Some(run.claim_timeout),
