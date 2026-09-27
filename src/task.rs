@@ -322,7 +322,7 @@ impl Router {
                 AssertUnwindSafe(execute)
                     .catch_unwind()
                     .await
-                    .unwrap_or(Err(Error::HandlerPanicked))
+                    .unwrap_or_else(|payload| Err(Error::handler_panicked(payload)))
             })
             .await
     }

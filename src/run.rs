@@ -181,7 +181,7 @@ fn failure_reason(error: &Error) -> FailureReason {
         Error::Handler { source } => {
             FailureReason::from_error_named("handler_error", source.as_ref())
         }
-        Error::HandlerPanicked => FailureReason::panic(),
+        Error::HandlerPanicked { message } => FailureReason::from_parts("panic", message),
         _ => FailureReason::from_error_named("elephant_error", error),
     }
 }

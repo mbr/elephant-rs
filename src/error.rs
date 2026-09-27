@@ -1,6 +1,6 @@
 //! Error types for Elephant.
 
-use std::{error, fmt, num::TryFromIntError};
+use std::{any::Any, error, fmt, num::TryFromIntError};
 
 use jiff::Error as JiffError;
 use serde_json::Error as JsonError;
@@ -37,8 +37,11 @@ pub enum Error {
         source: Box<dyn error::Error + Send + Sync>,
     },
     /// Indicates that a task handler panicked.
-    #[error("handler panicked")]
-    HandlerPanicked,
+    #[error("handler panicked: {message}")]
+    HandlerPanicked {
+        /// Carries the panic payload when it is a string.
+        message: String,
+    },
     /// Indicates that a retry strategy is invalid.
     #[error("invalid retry strategy")]
     InvalidRetryStrategy {
@@ -157,6 +160,18 @@ impl Error {
     /// Creates an error for a task handler failure.
     pub fn handler(source: Box<dyn error::Error + Send + Sync>) -> Self {
         Self::Handler { source }
+    }
+
+    /// Retains diagnostics from a caught handler or execution-wrapper panic.
+    pub(crate) fn handler_panicked(payload: Box<dyn Any + Send>) -> Self {
+        let message = if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&str>() {
+            message.to_string()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        Self::HandlerPanicked { message }
     }
 
     /// Maps database-specific Absurd states to typed errors.
