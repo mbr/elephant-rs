@@ -137,6 +137,31 @@ Waiting for a task result from the same queue inside a task is rejected because 
 can deadlock a worker pool. Cross-queue waits are available through
 `TaskContext::await_task_result`.
 
+## Execution instrumentation
+
+Every router dispatch has a `tracing` span carrying queue, task ID, run ID,
+attempt, and task name. Parameters and headers are never logged automatically.
+Handlers and execution wrappers can inspect `context.metadata().headers`.
+
+`Router::wrap_execution` establishes application context around every handler,
+including when using the convenience worker. For distributed tracing, extract
+your tracing carrier from headers in this wrapper and instrument the returned
+execution future with your application's span. Preserve errors unchanged:
+suspension and owning-run cancellation are runtime control flow, not failures.
+Use `SpawnBuilder::headers` from your application's enqueue wrapper to inject
+carriers; this also works with `send_on` and caller-owned transactions.
+
+```rust,no_run
+use elephant::task::Router;
+use tracing::Instrument;
+
+let router = Router::new().wrap_execution(|context, execute| async move {
+    let span = tracing::error_span!("application_task", task_id = %context.metadata().task_id);
+    execute.instrument(span).await
+});
+# let _ = router;
+```
+
 ## SQLx policy
 
 Most Absurd calls target stored procedures and dynamic queue tables. `elephant` keeps

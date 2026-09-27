@@ -1,13 +1,8 @@
 //! Typed task contracts, handler registration, and routing.
 
 use std::{
-    collections::HashMap,
-    future::Future,
-    marker::PhantomData,
-    ops::Deref,
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
-    time::Duration,
+    collections::HashMap, future::Future, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe,
+    sync::Arc, time::Duration,
 };
 
 use futures::{FutureExt, future::BoxFuture};
@@ -87,24 +82,16 @@ where
         F: Fn(TaskContext, P) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R>> + Send + 'static,
     {
-        let erased =
-            move |context: TaskContext, params: Value| -> BoxFuture<'static, Result<Value>> {
-                let params = match serde_json::from_value(params).map_err(Error::json) {
-                    Ok(params) => params,
-                    Err(error) => return Box::pin(async move { Err(error) }),
-                };
-                let future = catch_unwind(AssertUnwindSafe(|| handler(context, params)));
-                Box::pin(async move {
-                    let Ok(future) = future else {
-                        return Err(Error::HandlerPanicked);
-                    };
-                    let result = AssertUnwindSafe(future).catch_unwind().await;
-                    match result {
-                        Ok(value) => serde_json::to_value(value?).map_err(Error::json),
-                        Err(_) => Err(Error::HandlerPanicked),
-                    }
-                })
-            };
+        let handler = Arc::new(handler);
+        let erased = move |context: TaskContext, params: Value| -> TaskExecution {
+            let handler = Arc::clone(&handler);
+            async move {
+                let params = serde_json::from_value(params).map_err(Error::json)?;
+                let value = handler(context, params).await?;
+                serde_json::to_value(value).map_err(Error::json)
+            }
+            .boxed()
+        };
         TaskRegistration {
             task: self.clone(),
             erased: Arc::new(ErasedTask {
@@ -227,11 +214,19 @@ impl<P, R> Deref for TaskRegistration<P, R> {
     }
 }
 
+/// Represents one erased handler invocation, including its control-flow errors.
+pub type TaskExecution = BoxFuture<'static, Result<Value>>;
+
+/// Wraps an invocation with application-level execution context.
+type ExecutionWrapper = dyn Fn(TaskContext, TaskExecution) -> TaskExecution + Send + Sync;
+
 /// Routes claimed runs to registered handlers.
 #[derive(Clone)]
 pub struct Router {
     /// Shares the immutable dispatch table between active runs.
     tasks: Arc<HashMap<TaskName, Arc<ErasedTask>>>,
+    /// Installs application context around all registered handlers.
+    execution_wrapper: Option<Arc<ExecutionWrapper>>,
     /// Carries the unknown-task deferral range.
     unknown_task_delay: Duration,
 }
@@ -241,6 +236,7 @@ impl Default for Router {
     fn default() -> Self {
         Self {
             tasks: Arc::new(HashMap::new()),
+            execution_wrapper: None,
             unknown_task_delay: Duration::from_secs(5),
         }
     }
@@ -265,6 +261,22 @@ impl Router {
         Ok(self)
     }
 
+    /// Installs a wrapper around every handler, including convenience workers.
+    ///
+    /// Use metadata headers to establish application tracing or request context.
+    /// The wrapper must preserve execution errors, including suspension and
+    /// owning-run cancellation. Calling this again replaces the previous wrapper.
+    pub fn wrap_execution<F, Fut>(mut self, wrapper: F) -> Self
+    where
+        F: Fn(TaskContext, TaskExecution) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.execution_wrapper = Some(Arc::new(move |context, execute| {
+            wrapper(context, execute).boxed()
+        }));
+        self
+    }
+
     /// Sets the unknown-task deferral duration.
     pub fn unknown_task_delay(mut self, delay: Duration) -> Self {
         self.unknown_task_delay = delay;
@@ -272,6 +284,14 @@ impl Router {
     }
 
     /// Dispatches a claimed run without background lease supervision.
+    #[tracing::instrument(
+        level = "error", skip_all,
+        fields(queue = %lease.claimed_run().queue_name,
+            task_id = %lease.claimed_run().task_id,
+            run_id = %lease.claimed_run().run_id,
+            task_name = %lease.claimed_run().task_name,
+            attempt = lease.claimed_run().attempt)
+    )]
     pub async fn dispatch(&self, lease: RunLease) -> Result<()> {
         let client = lease.client().clone();
         let run = lease.claimed_run().clone();
@@ -288,7 +308,23 @@ impl Router {
             .into_iter()
             .collect();
         let context = TaskContext::new(client, &run, checkpoints);
-        lease.run((task.handler)(context, run.params)).await
+        let wrapper = self.execution_wrapper.clone();
+        let execute = async move {
+            let wrapped_context = context.clone();
+            let execute = async move { (task.handler)(context, run.params).await }.boxed();
+            match wrapper {
+                Some(wrapper) => wrapper(wrapped_context, execute).await,
+                None => execute.await,
+            }
+        };
+        lease
+            .run(async move {
+                AssertUnwindSafe(execute)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or(Err(Error::HandlerPanicked))
+            })
+            .await
     }
 
     /// Defers a run with an unknown task name.

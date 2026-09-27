@@ -143,6 +143,8 @@ async fn spawned_task_completes_through_router() -> Result<(), Box<dyn StdError 
 #[tokio::test]
 async fn headers_reach_typed_handlers() -> TestResult {
     let test = setup().await?;
+    let wrapper_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&wrapper_calls);
     let task = Task::<Input, Output>::builder("headers")?
         .handler(|context, _| async move {
             let headers = context
@@ -154,7 +156,20 @@ async fn headers_reach_typed_handlers() -> TestResult {
             Ok(Output { value: 1 })
         })
         .build();
-    let router = Router::new().task(task.clone())?;
+    let router = Router::new()
+        .task(task.clone())?
+        .wrap_execution(move |context, execute| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                context
+                    .metadata()
+                    .headers
+                    .as_ref()
+                    .expect("headers should reach wrapper")["traceparent"],
+                "parent-span"
+            );
+            async move { execute.await }
+        });
     let spawned = test
         .client
         .spawn(&task, Input { value: 0 })
@@ -168,6 +183,7 @@ async fn headers_reach_typed_handlers() -> TestResult {
             .await?,
         Output { value: 1 }
     );
+    assert_eq!(wrapper_calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
