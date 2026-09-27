@@ -1,6 +1,7 @@
 //! Integration tests against ephemeral PostgreSQL.
 
 use std::{
+    collections::BTreeMap,
     error::Error as StdError,
     fmt,
     sync::{
@@ -12,13 +13,14 @@ use std::{
 
 use elephant::{
     client::Client,
+    context::Step,
     error::Error,
     run::{ExecutionOptions, LeaseRenewal, LeaseWatchdogOptions},
     schema,
     task::{Router, Task},
     types::{
         CreateQueueOptions, PgInterval, QueueDetachMode, QueuePolicyOptions, RetryStrategy,
-        SpawnOptions, TaskResultState,
+        SpawnOptions, SpawnResult, Spawned, TaskResultSnapshot, TaskResultState,
     },
     worker::{WorkerOptions, work_batch},
 };
@@ -293,7 +295,7 @@ async fn checkpoint_replay_skips_completed_step() -> Result<(), Box<dyn StdError
                     })
                     .await?;
                 let repeated = context.step("once", || async { Ok(999) }).await?;
-                assert_eq!(repeated, value);
+                assert_eq!(repeated, 999);
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(Error::handler(Box::new(TestFailure)));
                 }
@@ -312,6 +314,132 @@ async fn checkpoint_replay_skips_completed_step() -> Result<(), Box<dyn StdError
 
     assert_eq!(result, Output { value: 7 });
     assert_eq!(step_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+/// Verifies replay of Go checkpoints and matching Rust-written wire formats.
+#[tokio::test]
+async fn checkpoints_interoperate_with_go() -> TestResult {
+    let fixture: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(include_str!("../testdata/go-checkpoints/checkpoints.json"))?;
+    for replay in [false, true] {
+        let test = setup().await?;
+        let expected = fixture.clone();
+        let task = Task::<bool, ()>::builder("fixture")?
+            .default_max_attempts(1)
+            .handler(move |context, replay| {
+                let expected = expected.clone();
+                async move {
+                    for i in 1..=3 {
+                        let value = if i == 2 {
+                            match context.clone().begin_step("charge").await? {
+                                Step::Done(done) => done.into_value(),
+                                Step::Pending(pending) => {
+                                    assert!(!replay, "decomposed checkpoint must replay");
+                                    pending.complete(i * 7).await?
+                                }
+                            }
+                        } else {
+                            context
+                                .step("charge", || async {
+                                    assert!(!replay, "step checkpoint must replay");
+                                    Ok(i * 7)
+                                })
+                                .await?
+                        };
+                        assert_eq!(value, i * 7);
+                    }
+                    for year in [2000, 2001] {
+                        if replay {
+                            context
+                                .sleep_for_named("nap", Duration::from_secs(3600))
+                                .await?;
+                        } else {
+                            context
+                                .sleep_until_named(
+                                    "nap",
+                                    format!("{year}-01-01T00:00:00.123456789Z").parse()?,
+                                )
+                                .await?;
+                        }
+                    }
+                    for _ in 0..2 {
+                        assert_eq!(context.await_event::<i32>("ready").await?, 99);
+                    }
+                    let child = Spawned::<serde_json::Value>::new(
+                        "children".parse()?,
+                        SpawnResult {
+                            task_id: context.metadata().task_id,
+                            run_id: context.metadata().run_id,
+                            attempt: 1,
+                            created: false,
+                        },
+                    );
+                    for name in [
+                        "child-completed",
+                        "child-null",
+                        "child-failed",
+                        "child-cancelled",
+                    ] {
+                        if replay {
+                            let result = context
+                                .await_task_result_named(name, &child, Some(Duration::ZERO))
+                                .await;
+                            match name {
+                                "child-completed" => {
+                                    assert_eq!(result?, serde_json::json!({"value": 42}))
+                                }
+                                "child-null" => assert_eq!(result?, serde_json::Value::Null),
+                                "child-failed" => {
+                                    assert!(matches!(result, Err(Error::TaskFailed { .. })))
+                                }
+                                _ => assert!(matches!(result, Err(Error::TaskCancelled { .. }))),
+                            }
+                        } else {
+                            let snapshot: TaskResultSnapshot =
+                                serde_json::from_value(expected[name].clone())
+                                    .map_err(Error::json)?;
+                            context.step(name, || async { Ok(snapshot) }).await?;
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .build();
+        let router = Router::new().task(task.clone())?;
+        let spawned = test.client.spawn(&task, replay).send().await?;
+        if replay {
+            for (name, state) in &fixture {
+                test.client
+                    .set_checkpoint(
+                        "default",
+                        spawned.result.task_id.as_uuid(),
+                        name,
+                        state,
+                        spawned.result.run_id.as_uuid(),
+                        None,
+                    )
+                    .await?;
+            }
+        } else {
+            test.client.emit_event("default", "ready", 99).await?;
+        }
+        work_batch(&test.client, &router, "default").await?;
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?;
+        let actual: BTreeMap<_, _> = test
+            .client
+            .get_checkpoints(
+                "default",
+                spawned.result.task_id.as_uuid(),
+                spawned.result.run_id.as_uuid(),
+            )
+            .await?
+            .into_iter()
+            .collect();
+        assert_eq!(actual, fixture);
+    }
     Ok(())
 }
 
@@ -344,7 +472,7 @@ async fn event_wait_resumes_after_emit() -> Result<(), Box<dyn StdError + Send +
         .get_checkpoint(
             "default",
             spawned.result.task_id.as_uuid(),
-            "event:ready",
+            "$awaitEvent:ready",
             false,
         )
         .await?
@@ -392,9 +520,10 @@ async fn sleep_replays_after_wakeup() -> Result<(), Box<dyn StdError + Send + Sy
         )
         .await?
         .expect("sleep should persist its wake time");
-    let wake_at = checkpoint.state["wake_at"]
+    let wake_at = checkpoint
+        .state
         .as_str()
-        .expect("sleep format uses a timestamp field");
+        .expect("sleep format is a timestamp string");
     wake_at.parse::<Timestamp>()?;
 
     tokio::time::sleep(Duration::from_millis(150)).await;

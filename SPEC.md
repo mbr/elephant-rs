@@ -165,8 +165,9 @@ default; explicit heartbeat is available for long work under manual dispatch.
 `step` returns a cached successful value or executes and checkpoints its closure.
 An error writes no successful checkpoint. `begin_step` returns `Step::Done` or a
 consuming `PendingStep`; completing one handle twice is prevented locally.
-Concurrent calls using the same checkpoint name are not single-flight and can
-execute multiple closures before either result is stored.
+Each call allocates the next occurrence of its base name before reading cached
+state. Concurrent calls are not single-flight and can execute different
+occurrences simultaneously.
 
 `sleep_for` and `sleep_until` checkpoint the wake time and schedule the run if the
 time has not arrived. Relative sleeps use the database clock. Named variants
@@ -193,28 +194,35 @@ its reference.
 
 ## Checkpoint identity and cross-language compatibility
 
-Names are exact durable identities. Reusing a name reuses its checkpoint, even
-within one execution. Logical IDs such as `charge:{order_id}` are preferable to
-encounter counters for unordered or parallel work. Changing value shape or
-meaning requires a new name or an explicit checkpoint migration.
+Checkpoint naming and built-in payloads follow the Go, Python, and TypeScript
+SDKs at Absurd `0.5.0`. Each base name has a per-dispatch occurrence counter,
+shared by context clones and all operation kinds. The first occurrence uses
+the base name; subsequent ones append `#2`, `#3`, and so on. Replay resets the
+counters rather than deriving them from stored checkpoints.
 
-The existing Elephant persisted conventions are retained:
+- Steps use caller base names and serialize successful values directly.
+- Sleeps use caller base names or `sleep`, storing RFC 3339 timestamp strings.
+- Events use caller base names or `$awaitEvent:{event_name}`, storing raw payloads.
+- Child waits use caller base names or `$awaitTaskResult:{task_id}`, storing a
+  terminal snapshot with optional result/failure payloads, including JSON null.
 
-- Steps use caller names and serialize successful values directly.
-- Sleeps use caller names or `sleep`, storing an object with a `wake_at` timestamp.
-- Events use caller names or `event:{event_name}`, storing the raw event payload.
-- Child waits use caller names or `$awaitTaskResult:{task_id}`, storing a terminal
-  result snapshot with optional result/failure payloads.
+Logical IDs such as `charge:{order_id}` are preferable for unordered or parallel
+work, where occurrence order can otherwise change on replay. Generated suffixes
+and operation prefixes must not be reused for unrelated application steps;
+operation kinds share one namespace. Changing value shape or meaning requires
+a new name or an explicit migration. An immutable event remains the same event
+across numbered waits; this is not stream consumption.
 
-Generated names must not be reused for unrelated application steps. There is no
-implicit namespace isolation between operation kinds.
+Go-generated PostgreSQL checkpoint fixtures cover both Rust replay and matching
+Rust writes. The pinned generator also verifies Go replay. Applications must
+still agree on names, call order, and JSON schemas across languages; these are
+workflow contracts, not properties guaranteed by the shared SQL schema.
 
-The Go, Python, and TypeScript SDKs at Absurd `0.5.0` append occurrence suffixes
-for repeated names, store sleeps as timestamp strings, and generate event keys
-with `$awaitEvent:`. Elephant deliberately does not copy occurrence counting or
-silently rewrite existing sleep/event formats. Matching SQL schemas enable
-cross-language producers and consumers with agreed JSON schemas, but do not
-guarantee that an existing workflow can resume under a different SDK.
+Earlier Elephant snapshots used exact-name reuse, object-shaped sleeps, and
+`event:` defaults. Upgrading these executions requires draining them under the
+old implementation or an application-specific migration. Do not concurrently
+route them to old and new implementations. Auto-detection cannot infer missing
+occurrences or the intended side effects of an old repeated-name workflow.
 
 ## Errors, panics, and instrumentation
 

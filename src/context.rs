@@ -9,7 +9,7 @@ use std::{
 };
 
 use jiff::Timestamp;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::time::{Instant, interval_at};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +53,8 @@ pub struct TaskContext {
     renewed_in_background: bool,
     /// Caches visible checkpoint payloads.
     checkpoints: Arc<Mutex<HashMap<String, Value>>>,
+    /// Counts each base name's occurrences within this execution.
+    checkpoint_counts: Arc<Mutex<HashMap<String, usize>>>,
     /// Carries the claim extension used by checkpoint writes.
     checkpoint_extend_by: Option<Duration>,
 }
@@ -74,6 +76,7 @@ impl TaskContext {
             cancellation: CancellationToken::new(),
             renewed_in_background: false,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
+            checkpoint_counts: Arc::default(),
             checkpoint_extend_by: Some(run.claim_timeout),
         }
     }
@@ -120,24 +123,10 @@ impl TaskContext {
         Fut: Future<Output = Result<T>>,
         Fun: FnOnce() -> Fut,
     {
-        let step_name = step_name.as_ref().parse::<StepName>()?;
-        if let Some(value) = self.checkpoint_value(step_name.as_str()) {
-            return serde_json::from_value(value).map_err(Error::json);
+        match self.begin_step(step_name).await? {
+            Step::Done(done) => Ok(done.into_value()),
+            Step::Pending(pending) => pending.complete(run().await?).await,
         }
-        let value = run().await?;
-        let payload = serde_json::to_value(&value).map_err(Error::json)?;
-        self.client
-            .set_checkpoint(
-                self.metadata.queue_name.as_str(),
-                self.metadata.task_id.as_uuid(),
-                step_name.as_str(),
-                &payload,
-                self.metadata.run_id.as_uuid(),
-                self.checkpoint_extend_by,
-            )
-            .await?;
-        self.insert_checkpoint(step_name.as_str(), payload);
-        Ok(value)
     }
 
     /// Begins a decomposed durable step.
@@ -145,7 +134,7 @@ impl TaskContext {
     where
         T: DeserializeOwned + Serialize,
     {
-        let step_name = step_name.as_ref().parse::<StepName>()?;
+        let step_name = self.next_checkpoint_name(step_name.as_ref())?;
         if let Some(value) = self.checkpoint_value(step_name.as_str()) {
             let value = serde_json::from_value(value).map_err(Error::json)?;
             Ok(Step::Done(DoneStep {
@@ -172,7 +161,7 @@ impl TaskContext {
         step_name: impl AsRef<str>,
         wake_at: Timestamp,
     ) -> Result<()> {
-        let step_name = step_name.as_ref().parse::<StepName>()?;
+        let step_name = self.next_checkpoint_name(step_name.as_ref())?;
         let wake_at = self.sleep_checkpoint(step_name.as_str(), wake_at).await?;
         self.suspend_until(wake_at).await
     }
@@ -188,13 +177,9 @@ impl TaskContext {
         step_name: impl AsRef<str>,
         duration: Duration,
     ) -> Result<()> {
-        let step_name = step_name.as_ref().parse::<StepName>()?;
+        let step_name = self.next_checkpoint_name(step_name.as_ref())?;
         let wake_at = match self.checkpoint_value(step_name.as_str()) {
-            Some(value) => {
-                let checkpoint: SleepCheckpoint =
-                    serde_json::from_value(value).map_err(Error::json)?;
-                checkpoint.wake_at
-            }
+            Some(value) => serde_json::from_value(value).map_err(Error::json)?,
             None => {
                 let wake_at = self.client.current_time().await?.saturating_add(duration)?;
                 self.persist_sleep_checkpoint(step_name.as_str(), wake_at)
@@ -223,7 +208,7 @@ impl TaskContext {
         T: DeserializeOwned,
     {
         let event_name = event_name.as_ref().parse::<EventName>()?;
-        let step_name = format!("event:{event_name}");
+        let step_name = format!("$awaitEvent:{event_name}");
         self.await_event_named_with_timeout(step_name, event_name.as_str(), timeout)
             .await
     }
@@ -251,8 +236,11 @@ impl TaskContext {
     where
         T: DeserializeOwned,
     {
-        let step_name = step_name.as_ref().parse::<StepName>()?;
         let event_name = event_name.as_ref().parse::<EventName>()?;
+        let step_name = self.next_checkpoint_name(step_name.as_ref())?;
+        if let Some(payload) = self.checkpoint_value(step_name.as_str()) {
+            return serde_json::from_value(payload).map_err(Error::json);
+        }
         let raw = self
             .client
             .await_event_raw(
@@ -271,6 +259,7 @@ impl TaskContext {
             Some(payload) => payload,
             None => return Err(Error::EventTimeout),
         };
+        self.insert_checkpoint(step_name.as_str(), payload.clone());
         serde_json::from_value(payload).map_err(Error::json)
     }
 
@@ -354,8 +343,7 @@ impl TaskContext {
     /// Creates or reads a durable sleep checkpoint.
     async fn sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<Timestamp> {
         if let Some(value) = self.checkpoint_value(step_name) {
-            let checkpoint: SleepCheckpoint = serde_json::from_value(value).map_err(Error::json)?;
-            return Ok(checkpoint.wake_at);
+            return serde_json::from_value(value).map_err(Error::json);
         }
         self.persist_sleep_checkpoint(step_name, wake_at).await?;
         Ok(wake_at)
@@ -363,8 +351,7 @@ impl TaskContext {
 
     /// Persists a durable sleep checkpoint.
     async fn persist_sleep_checkpoint(&self, step_name: &str, wake_at: Timestamp) -> Result<()> {
-        let checkpoint = SleepCheckpoint { wake_at };
-        let payload = serde_json::to_value(checkpoint).map_err(Error::json)?;
+        let payload = serde_json::to_value(wake_at).map_err(Error::json)?;
         self.client
             .set_checkpoint(
                 self.metadata.queue_name.as_str(),
@@ -394,6 +381,22 @@ impl TaskContext {
         Err(Error::Suspended)
     }
 
+    /// Allocates the next occurrence of a base checkpoint name.
+    fn next_checkpoint_name(&self, name: &str) -> Result<StepName> {
+        let name = name.parse::<StepName>()?;
+        let mut counts = self
+            .checkpoint_counts
+            .lock()
+            .expect("checkpoint counter lock poisoned");
+        let count = counts.entry(name.to_string()).or_default();
+        *count += 1;
+        if *count == 1 {
+            Ok(name)
+        } else {
+            format!("{name}#{count}").parse()
+        }
+    }
+
     /// Fetches a cached checkpoint payload.
     fn checkpoint_value(&self, step_name: &str) -> Option<Value> {
         let guard = self
@@ -411,13 +414,6 @@ impl TaskContext {
             .expect("checkpoint cache lock poisoned");
         guard.insert(step_name.to_string(), value);
     }
-}
-
-/// Describes a durable sleep checkpoint.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct SleepCheckpoint {
-    /// Carries the time when the sleep should be complete.
-    wake_at: Timestamp,
 }
 
 /// Marks a pending step.

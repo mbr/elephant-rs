@@ -180,12 +180,13 @@ capacity, and do not abandon in-flight claim queries during shutdown.
 
 ## Sleeps and events
 
-`TaskContext::sleep_for` and `TaskContext::sleep_until` use a default durable
-sleep checkpoint. Use `sleep_for_named` or `sleep_until_named` when a workflow has
-multiple sleeps or sleeps in a loop.
+`TaskContext::sleep_for` and `TaskContext::sleep_until` use the base checkpoint
+name `sleep`. Named variants choose a different base name. Repeated sleeps are
+numbered automatically, including within loops.
 
-`TaskContext::await_event` derives a checkpoint name from the event name. Use
-`await_event_named` when the same event can be awaited in multiple places.
+`TaskContext::await_event` derives its base checkpoint name from the event name;
+`await_event_named` selects one explicitly. Repeated waits get separate
+checkpoints, but an event name remains immutable: this is not an event stream.
 
 Waiting for a task result from the same queue inside a task is rejected because it
 can deadlock a worker pool. Cross-queue waits are available through
@@ -201,32 +202,36 @@ same-queue restrictions.
 
 ## Checkpoint compatibility
 
-Checkpoint identity is an exact name. Repeating `step("charge", ...)` returns the
-same saved value, including within a loop. For multiple operations, use stable
-logical IDs such as `charge:{order_id}`, not iteration order. Concurrent use of
-the same name is not single-flight: multiple closures can execute before either
-writes its checkpoint. Version names when payload shape or meaning changes.
+Elephant follows the Go, Python, and TypeScript SDKs in Absurd `0.5.0`: repeated
+names allocate `charge`, `charge#2`, `charge#3`, and so on. Counters start over on
+each dispatch and are shared by context clones and all operation kinds,
+including decomposed steps. Replaying the same call sequence reuses the same
+checkpoints; repeating a call within one execution allocates another occurrence.
 
-The Go, Python, and TypeScript SDKs in Absurd `0.5.0` instead assign occurrence
-suffixes (`charge`, `charge#2`, ...). Literal translations of their loops are not
-behaviorally equivalent. Elephant deliberately retains explicit exact-name
-identity rather than adopting implicit occurrence counters.
+Use stable logical names such as `charge:{order_id}` for unordered or parallel
+work; occurrence assignment follows invocation/poll order, not completion order.
+Do not use generated suffixes or reserved operation prefixes for unrelated
+steps. These APIs do not provide same-name single-flight execution. Version
+names when payload shape or meaning changes.
 
-Persisted conventions are also part of the compatibility contract:
-
-| Operation | Elephant checkpoint convention |
+| Operation | Base name and persisted value |
 | --- | --- |
-| Step | Exact caller name; serialized successful value |
-| Sleep | Caller name, or `sleep`; object with a `wake_at` timestamp string |
-| Event | Caller name, or `event:{event_name}`; raw event payload |
+| Step | Caller name; serialized successful value |
+| Sleep | Caller name, or `sleep`; RFC 3339 timestamp string |
+| Event | Caller name, or `$awaitEvent:{event_name}`; raw event payload |
 | Child result | Caller name, or `$awaitTaskResult:{task_id}`; terminal snapshot |
 
-Do not reuse generated names for unrelated steps. Upstream sleep checkpoints
-are timestamp strings, not Elephant's object; upstream default event names use
-`$awaitEvent:`. These existing Elephant formats are intentionally preserved.
-Cross-language enqueueing works with agreed JSON parameter/result schemas, but
-taking over existing workflow executions requires explicit checkpoint-name and
-payload migration. Sharing the SQL schema alone is not sufficient.
+Go-generated PostgreSQL fixtures test both replay and Rust-written formats,
+including repeated names, sleeps, events, and child snapshots. Cross-language
+workflows must still agree on names, call order, and application JSON schemas.
+For Rust's unnamed sleep helpers, use `sleep` as the name in other SDKs.
+
+**Upgrade from earlier Elephant snapshots:** those used exact-name reuse,
+`{wake_at: ...}` sleep objects, and `event:` defaults. This is a breaking replay
+change. Drain existing workflows with the old SDK before upgrading, or migrate
+checkpoints with application-specific knowledge. Do not mix old and new workers
+for those task types; automatic format detection cannot recover the intended
+meaning of old repeated-name workflows.
 
 ## Execution instrumentation
 
