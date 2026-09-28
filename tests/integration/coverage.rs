@@ -1229,6 +1229,36 @@ async fn handler_failure_retains_category_and_message() -> TestResult {
     Ok(())
 }
 
+/// Verifies unrelated SQLSTATE errors preserve their structured database source.
+#[tokio::test]
+async fn database_error_preserves_sqlstate_and_source() -> TestResult {
+    let test = setup().await?;
+    let error = test
+        .client
+        .set_queue_policy(
+            "default",
+            QueuePolicyOptions {
+                cleanup_ttl: Some("not an interval".parse()?),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("invalid interval");
+    assert!(
+        std::error::Error::source(&error)
+            .expect("source")
+            .to_string()
+            .contains("not an interval")
+    );
+    let Error::Sqlx { source } = error else {
+        panic!("unexpected error: {error:?}")
+    };
+    let database = source.as_database_error().expect("database source");
+    assert_eq!(database.code().as_deref(), Some("22007"));
+    assert!(database.message().contains("not an interval"));
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
