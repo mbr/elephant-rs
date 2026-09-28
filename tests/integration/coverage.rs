@@ -279,6 +279,44 @@ async fn distinct_and_absent_idempotency_keys() -> TestResult {
     Ok(())
 }
 
+/// Verifies completion does not release an idempotency key.
+#[tokio::test]
+async fn completed_task_retains_idempotency_key() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("retained")?
+        .handler(|_, ()| async { Ok(()) })
+        .build();
+    let first = test
+        .client
+        .spawn(&task, ())
+        .idempotency_key("key")
+        .send()
+        .await?;
+    work_batch(&test.client, &Router::new().task(task.clone())?, "default").await?;
+    assert_eq!(
+        task_row(&test.client, first.result.task_id).await?["state"],
+        "completed"
+    );
+    let duplicate = test
+        .client
+        .spawn(&task, ())
+        .idempotency_key("key")
+        .send()
+        .await?;
+    assert_eq!(
+        duplicate.result,
+        elephant::types::SpawnResult {
+            created: false,
+            ..first.result
+        }
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.t_default")
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
