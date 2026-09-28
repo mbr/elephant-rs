@@ -1794,6 +1794,49 @@ async fn repeated_wait_after_timeout_does_not_resuspend() -> TestResult {
     Ok(())
 }
 
+/// Verifies full task result snapshots through enqueue, claim, and completion.
+#[tokio::test]
+async fn task_result_snapshot_lifecycle() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), Value>::builder("snapshot")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let mut expected = elephant::types::TaskResultSnapshot {
+        state: TaskResultState::Pending,
+        result: None,
+        failure: None,
+    };
+    assert_eq!(
+        test.client
+            .fetch_task_result("default", spawned.result.task_id.as_uuid())
+            .await?,
+        Some(expected.clone())
+    );
+    let lease = test
+        .client
+        .claim_task("default", &Default::default())
+        .await?
+        .pop()
+        .expect("claim");
+    expected.state = TaskResultState::Running;
+    assert_eq!(
+        test.client
+            .fetch_task_result("default", spawned.result.task_id.as_uuid())
+            .await?,
+        Some(expected.clone())
+    );
+    let value = serde_json::json!({"answer": 42});
+    lease.complete(&value).await?;
+    expected.state = TaskResultState::Completed;
+    expected.result = Some(value);
+    assert_eq!(
+        test.client
+            .fetch_task_result("default", spawned.result.task_id.as_uuid())
+            .await?,
+        Some(expected)
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
