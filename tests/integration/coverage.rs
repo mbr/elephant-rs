@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -1859,6 +1859,60 @@ async fn pending_task_result_polling_times_out() -> TestResult {
     assert_eq!(
         task_row(&test.client, spawned.result.task_id).await?["state"],
         "pending"
+    );
+    Ok(())
+}
+
+/// Verifies execution wrappers enclose handler polling and receive the task identity.
+#[tokio::test]
+async fn execution_wrapper_order_and_identity() -> TestResult {
+    let test = setup().await?;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handler_events = events.clone();
+    let task = Task::<(), ()>::builder("wrapped")?
+        .handler(move |context, ()| {
+            let events = handler_events.clone();
+            async move {
+                tokio::task::yield_now().await;
+                events
+                    .lock()
+                    .expect("events")
+                    .push(("handler", context.metadata().task_id));
+                Ok(())
+            }
+        })
+        .build();
+    let wrapper_events = events.clone();
+    let router = Router::new()
+        .task(task.clone())?
+        .wrap_execution(move |context, execute| {
+            let events = wrapper_events.clone();
+            async move {
+                events
+                    .lock()
+                    .expect("events")
+                    .push(("before", context.metadata().task_id));
+                let result = execute.await;
+                events
+                    .lock()
+                    .expect("events")
+                    .push(("after", context.metadata().task_id));
+                result
+            }
+        });
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        *events.lock().expect("events"),
+        vec![
+            ("before", spawned.result.task_id),
+            ("handler", spawned.result.task_id),
+            ("after", spawned.result.task_id)
+        ]
+    );
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "completed"
     );
     Ok(())
 }
