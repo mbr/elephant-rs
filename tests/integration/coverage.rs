@@ -1203,6 +1203,32 @@ async fn cleanup_respects_task_and_event_ttl() -> TestResult {
     Ok(())
 }
 
+/// Verifies ordinary handler diagnostics survive run and task persistence.
+#[tokio::test]
+async fn handler_failure_retains_category_and_message() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("diagnostic")?
+        .default_max_attempts(1)
+        .handler(|_, ()| async { Err(Error::handler(Box::new(TestFailure))) })
+        .build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &Router::new().task(task)?, "default").await?;
+    let snapshot = test
+        .client
+        .fetch_task_result("default", spawned.result.task_id.as_uuid())
+        .await?
+        .expect("task");
+    assert_eq!(snapshot.state, TaskResultState::Failed);
+    let failure = snapshot.failure.expect("failure");
+    assert_eq!(failure["name"], "handler_error");
+    assert_eq!(failure["message"], "intentional test failure");
+    assert_eq!(
+        run_row(&test.client, spawned.result.run_id).await?["failure_reason"],
+        failure
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
