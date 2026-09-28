@@ -1031,6 +1031,66 @@ async fn zero_heartbeat_preserves_expiry_and_fails() -> TestResult {
     Ok(())
 }
 
+/// Verifies batch claim identities, ownership, expiry, and exclusion of competitors.
+#[tokio::test]
+async fn live_claims_exclude_other_workers() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("exclusive")?.build();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(test.client.spawn(&task, ()).send().await?.result.task_id);
+    }
+    let leases = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                worker_id: "owner".into(),
+                claim_timeout: Duration::from_secs(60),
+                batch_size: 3,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut claimed = leases
+        .iter()
+        .map(|lease| lease.claimed_run().task_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    claimed.sort();
+    assert_eq!(claimed, ids);
+    for lease in &leases {
+        let row = run_row(&test.client, lease.claimed_run().run_id).await?;
+        assert_eq!(row["claimed_by"], "owner");
+        assert_eq!(
+            row["claim_expires_at"]
+                .as_str()
+                .expect("expiry")
+                .parse::<jiff::Timestamp>()?,
+            "2025-01-01T00:01:00Z".parse::<jiff::Timestamp>()?
+        );
+    }
+    clock(&test.client, 59).await?;
+    assert!(
+        test.client
+            .claim_task(
+                "default",
+                &elephant::worker::ClaimOptions {
+                    worker_id: "competitor".into(),
+                    batch_size: 3,
+                    ..Default::default()
+                }
+            )
+            .await?
+            .is_empty()
+    );
+    for lease in leases {
+        lease.complete(()).await?;
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
