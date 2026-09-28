@@ -806,6 +806,25 @@ async fn cancel_event_suspended_task() -> TestResult {
     Ok(())
 }
 
+/// Verifies cancellation of a missing task retains the database's not-found cause.
+#[tokio::test]
+async fn cancel_missing_task_reports_error() -> TestResult {
+    let test = setup().await?;
+    let id = uuid::Uuid::nil();
+    let error = test
+        .client
+        .cancel_task("default", id)
+        .await
+        .expect_err("missing task");
+    let Error::Sqlx { source } = error else {
+        panic!("expected database error, got {error:?}")
+    };
+    let database = source.as_database_error().expect("database cause");
+    assert!(database.message().contains("not found"));
+    assert!(database.message().contains(&id.to_string()));
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
