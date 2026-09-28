@@ -2196,6 +2196,48 @@ async fn worker_refills_slot_alongside_slow_handler() -> TestResult {
     .await
 }
 
+/// Verifies freeing capacity triggers claiming without waiting for the idle poll delay.
+#[tokio::test]
+async fn worker_refills_capacity_without_poll_delay() -> TestResult {
+    let test = setup().await?;
+    let release = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = observed_task(vec![release.clone(), release.clone()], sender)?;
+    for index in 0..3 {
+        test.client.spawn(&task, index).send().await?;
+    }
+    let scenario = async {
+        let _stop = shutdown.clone().drop_guard();
+        let _release = release.clone().drop_guard();
+        let mut initial = [
+            next_started(&mut receiver).await?,
+            next_started(&mut receiver).await?,
+        ];
+        initial.sort();
+        assert_eq!(initial, [0, 1]);
+        release.cancel();
+        assert_eq!(next_started(&mut receiver).await?, 2);
+        Ok(())
+    };
+    worker_scenario(
+        &test,
+        Router::new().task(task)?,
+        WorkerOptions {
+            concurrency: 2,
+            claim: elephant::worker::ClaimOptions {
+                batch_size: 2,
+                empty_poll_delay: Duration::from_secs(3600),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &shutdown,
+        scenario,
+    )
+    .await
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
