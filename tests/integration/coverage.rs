@@ -1,6 +1,8 @@
 //! Behavioral coverage shared with the upstream SDK suites.
 
-use elephant::types::{CreateQueueOptions, QueueStorageMode};
+use elephant::types::{
+    CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions, QueueStorageMode,
+};
 
 use super::{TestResult, setup};
 
@@ -32,6 +34,63 @@ async fn partitioned_queue_relations() -> TestResult {
                 .await?;
         assert_eq!(actual, kind, "{prefix}_partitioned");
     }
+    Ok(())
+}
+
+/// Verifies every policy field survives creation and partial updates.
+#[tokio::test]
+async fn full_queue_policy_round_trip() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .create_queue(
+            "policy",
+            CreateQueueOptions {
+                storage_mode: QueueStorageMode::Partitioned,
+                policy: QueuePolicyOptions {
+                    partition_lookahead: Some("2 days".parse()?),
+                    partition_lookback: Some("1 day".parse()?),
+                    cleanup_ttl: Some("1 hour".parse()?),
+                    cleanup_limit: Some(321),
+                    detach_mode: Some(QueueDetachMode::Empty),
+                    detach_min_age: Some("1 day".parse()?),
+                },
+            },
+        )
+        .await?;
+    let mut expected = QueuePolicy {
+        queue_name: "policy".parse()?,
+        storage_mode: QueueStorageMode::Partitioned,
+        partition_lookahead: "2 days".into(),
+        partition_lookback: "1 day".into(),
+        cleanup_ttl: "01:00:00".into(),
+        cleanup_limit: 321,
+        detach_mode: QueueDetachMode::Empty,
+        detach_min_age: "1 day".into(),
+    };
+    assert_eq!(
+        test.client.get_queue_policy("policy").await?,
+        Some(expected.clone())
+    );
+    test.client
+        .set_queue_policy(
+            "policy",
+            QueuePolicyOptions {
+                cleanup_ttl: Some("2 hours".parse()?),
+                cleanup_limit: Some(32),
+                detach_mode: Some(QueueDetachMode::None),
+                detach_min_age: Some("3 days".parse()?),
+                ..QueuePolicyOptions::default()
+            },
+        )
+        .await?;
+    expected.cleanup_ttl = "02:00:00".into();
+    expected.cleanup_limit = 32;
+    expected.detach_mode = QueueDetachMode::None;
+    expected.detach_min_age = "3 days".into();
+    assert_eq!(
+        test.client.get_queue_policy("policy").await?,
+        Some(expected)
+    );
     Ok(())
 }
 
