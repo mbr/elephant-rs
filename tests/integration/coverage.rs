@@ -317,6 +317,46 @@ async fn completed_task_retains_idempotency_key() -> TestResult {
     Ok(())
 }
 
+/// Verifies idempotency keys do not deduplicate tasks across queues.
+#[tokio::test]
+async fn idempotency_keys_are_queue_scoped() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .create_queue("other", CreateQueueOptions::default())
+        .await?;
+    let task = Task::<(), ()>::builder("scoped")?.build();
+    let first = test
+        .client
+        .spawn(&task, ())
+        .idempotency_key("key")
+        .send()
+        .await?;
+    let second = test
+        .client
+        .spawn(&task, ())
+        .queue("other")?
+        .idempotency_key("key")
+        .send()
+        .await?;
+    assert!(first.result.created && second.result.created);
+    assert_ne!(first.result.task_id, second.result.task_id);
+    assert_ne!(first.result.run_id, second.result.run_id);
+    for spawned in [&first, &second] {
+        assert_eq!(
+            test.client
+                .fetch_task_result(
+                    spawned.queue_name.as_str(),
+                    spawned.result.task_id.as_uuid()
+                )
+                .await?
+                .expect("task")
+                .state,
+            TaskResultState::Pending
+        );
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
