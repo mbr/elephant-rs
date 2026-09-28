@@ -94,6 +94,44 @@ async fn full_queue_policy_round_trip() -> TestResult {
     Ok(())
 }
 
+/// Verifies valid non-identifier queue names work through the SQL boundary.
+#[tokio::test]
+async fn permissive_queue_names() -> TestResult {
+    let test = setup().await?;
+    for name in ["Uppercase", "with spaces", "with-hyphens", "   "] {
+        test.client
+            .create_queue(name, CreateQueueOptions::default())
+            .await?;
+        test.client.emit_event(name, "event", &42).await?;
+        assert!(
+            test.client
+                .list_queues()
+                .await?
+                .iter()
+                .any(|queue| queue.as_str() == name)
+        );
+        assert_eq!(
+            test.client
+                .get_queue_policy(name)
+                .await?
+                .expect("created queue")
+                .queue_name
+                .as_str(),
+            name
+        );
+        test.client.drop_queue(name).await?;
+        assert!(
+            !test
+                .client
+                .list_queues()
+                .await?
+                .iter()
+                .any(|queue| queue.as_str() == name)
+        );
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {

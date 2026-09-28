@@ -831,9 +831,9 @@ fn whole_seconds_ceil(duration: Duration) -> u64 {
         .saturating_add(u64::from(duration.subsec_nanos() > 0))
 }
 
-/// Validates a named string.
+/// Validates names, permitting whitespace-only PostgreSQL queue identifiers.
 fn validate_named(kind: &'static str, value: &str, max_bytes: Option<usize>) -> Result<String> {
-    if value.trim().is_empty() {
+    if value.is_empty() || (kind != "queue" && value.trim().is_empty()) {
         return Err(Error::InvalidName {
             kind,
             value: value.to_string(),
