@@ -1091,6 +1091,66 @@ async fn live_claims_exclude_other_workers() -> TestResult {
     Ok(())
 }
 
+/// Verifies database recovery fences an abandoned run and transfers ownership.
+#[tokio::test]
+async fn expired_claim_is_retried_by_another_worker() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("abandoned")?
+        .default_max_attempts(2)
+        .build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let old = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                worker_id: "worker-a".into(),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("first claim");
+    old.forget();
+    clock(&test.client, 300).await?;
+    let new = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                worker_id: "worker-b".into(),
+                claim_timeout: Duration::from_secs(45),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("reclaimed run");
+    assert_eq!(new.claimed_run().task_id, spawned.result.task_id);
+    assert_ne!(new.claimed_run().run_id, spawned.result.run_id);
+    assert_eq!(new.claimed_run().attempt, 2);
+    let expired = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(expired["state"], "failed");
+    assert_eq!(expired["failure_reason"]["name"], "$ClaimTimeout");
+    assert_eq!(expired["failure_reason"]["workerId"], "worker-a");
+    assert_eq!(expired["failure_reason"]["attempt"], 1);
+    let current = run_row(&test.client, new.claimed_run().run_id).await?;
+    assert_eq!(current["state"], "running");
+    assert_eq!(current["claimed_by"], "worker-b");
+    let row = task_row(&test.client, spawned.result.task_id).await?;
+    assert_eq!(row["state"], "running");
+    assert_eq!(row["attempts"], 2);
+    assert!(matches!(
+        test.client
+            .complete_run("default", spawned.result.run_id.as_uuid(), ())
+            .await,
+        Err(Error::RunAlreadyFailed)
+    ));
+    new.complete(()).await?;
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
