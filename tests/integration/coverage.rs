@@ -2303,6 +2303,53 @@ async fn worker_does_not_query_claims_at_capacity() -> TestResult {
     .await
 }
 
+/// Verifies shutdown drains active work while leaving the unclaimed backlog pending.
+#[tokio::test]
+async fn worker_shutdown_leaves_backlog_unclaimed() -> TestResult {
+    let test = setup().await?;
+    let release = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = observed_task(vec![release.clone()], sender)?;
+    let active = test.client.spawn(&task, 0).send().await?;
+    let pending = test.client.spawn(&task, 1).send().await?;
+    let scenario = async {
+        let _stop = shutdown.clone().drop_guard();
+        let _release = release.clone().drop_guard();
+        assert_eq!(next_started(&mut receiver).await?, 0);
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            task_row(&test.client, active.result.task_id).await?["state"],
+            "running"
+        );
+        assert_eq!(
+            task_row(&test.client, pending.result.task_id).await?["state"],
+            "pending"
+        );
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    };
+    worker_scenario(
+        &test,
+        Router::new().task(task)?,
+        WorkerOptions::default(),
+        &shutdown,
+        scenario,
+    )
+    .await?;
+    assert_eq!(
+        task_row(&test.client, active.result.task_id).await?["state"],
+        "completed"
+    );
+    assert_eq!(
+        task_row(&test.client, pending.result.task_id).await?["state"],
+        "pending"
+    );
+    assert!(receiver.try_recv().is_err());
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
