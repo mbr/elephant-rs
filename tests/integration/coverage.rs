@@ -825,6 +825,48 @@ async fn cancel_missing_task_reports_error() -> TestResult {
     Ok(())
 }
 
+/// Verifies cancelled leases cannot write checkpoints or register event waits.
+#[tokio::test]
+async fn cancellation_blocks_checkpoint_and_event_writes() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("cancel-writes")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let lease = test
+        .client
+        .claim_task("default", &Default::default())
+        .await?
+        .pop()
+        .expect("claim");
+    let task_id = spawned.result.task_id.as_uuid();
+    let run_id = spawned.result.run_id.as_uuid();
+    test.client.cancel_task("default", task_id).await?;
+    assert!(matches!(
+        test.client
+            .set_checkpoint("default", task_id, "late", 1, run_id, None)
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        test.client
+            .await_event_raw("default", task_id, run_id, "wait", "event", None)
+            .await,
+        Err(Error::Cancelled)
+    ));
+    assert!(
+        test.client
+            .get_checkpoint("default", task_id, "late", true)
+            .await?
+            .is_none()
+    );
+    let waits: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.w_default WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(waits, 0);
+    lease.forget();
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
