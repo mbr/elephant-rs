@@ -1837,6 +1837,32 @@ async fn task_result_snapshot_lifecycle() -> TestResult {
     Ok(())
 }
 
+/// Verifies result polling times out without mutating a nonterminal task.
+#[tokio::test]
+async fn pending_task_result_polling_times_out() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("pending-result")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        test.client.await_task_result(
+            "default",
+            spawned.result.task_id.as_uuid(),
+            Some(Duration::from_millis(30)),
+        ),
+    )
+    .await?
+    .expect_err("result timeout");
+    assert!(
+        matches!(error, Error::TaskResultTimeout { task_id } if task_id == spawned.result.task_id.as_uuid())
+    );
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "pending"
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
