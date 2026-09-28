@@ -1660,6 +1660,51 @@ async fn event_emission_is_first_write_wins() -> TestResult {
     Ok(())
 }
 
+/// Verifies an event timeout removes its registration and can be handled normally.
+#[tokio::test]
+async fn event_timeout_resumes_and_cleans_wait() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), bool>::builder("event-timeout")?
+        .handler(|context, ()| async move {
+            match context
+                .await_event_with_timeout::<Value>("missing", Some(Duration::from_secs(10)))
+                .await
+            {
+                Err(Error::EventTimeout) => Ok(true),
+                Err(error) => Err(error),
+                Ok(_) => Ok(false),
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    let registered: (i64, bool) = sqlx::query_as("SELECT count(*), bool_and(timeout_at = timestamptz '2025-01-01 00:00:10Z') FROM absurd.w_default WHERE task_id = $1")
+        .bind(spawned.result.task_id.as_uuid()).fetch_one(test.client.pool()).await?;
+    assert_eq!(registered, (1, true));
+    let sleeping = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(
+        sleeping["available_at"]
+            .as_str()
+            .expect("deadline")
+            .parse::<jiff::Timestamp>()?,
+        "2025-01-01T00:00:10Z".parse::<jiff::Timestamp>()?
+    );
+    clock(&test.client, 10).await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?
+    );
+    let waits: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.w_default")
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(waits, 0);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
