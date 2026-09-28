@@ -1619,6 +1619,47 @@ async fn event_registration_state_transitions() -> TestResult {
     Ok(())
 }
 
+/// Verifies duplicate event emission preserves the first payload and timestamp.
+#[tokio::test]
+async fn event_emission_is_first_write_wins() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    test.client.emit_event("default", "immutable", &1).await?;
+    let original: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(e) FROM absurd.e_default e WHERE event_name = 'immutable'",
+    )
+    .fetch_one(test.client.pool())
+    .await?;
+    clock(&test.client, 10).await?;
+    test.client.emit_event("default", "immutable", &2).await?;
+    let repeated: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(e) FROM absurd.e_default e WHERE event_name = 'immutable'",
+    )
+    .fetch_one(test.client.pool())
+    .await?;
+    assert_eq!(original, repeated);
+    assert_eq!(repeated["payload"], 1);
+    assert_eq!(
+        repeated["emitted_at"]
+            .as_str()
+            .expect("emission timestamp")
+            .parse::<jiff::Timestamp>()?,
+        "2025-01-01T00:00:00Z".parse::<jiff::Timestamp>()?
+    );
+    let task = Task::<(), i32>::builder("late-event")?
+        .handler(|context, ()| async move { context.await_event("immutable").await })
+        .build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &Router::new().task(task)?, "default").await?;
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        1
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
