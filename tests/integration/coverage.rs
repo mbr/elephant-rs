@@ -2238,6 +2238,71 @@ async fn worker_refills_capacity_without_poll_delay() -> TestResult {
     .await
 }
 
+/// Records real claim invocations without replacing the underlying queue behavior.
+async fn observe_claim_queries(client: &Client) -> elephant::error::Result<()> {
+    sqlx::raw_sql(r#"
+        CREATE TABLE public.claim_calls (id bigserial PRIMARY KEY, qty integer NOT NULL);
+        ALTER FUNCTION absurd.claim_task(text, text, integer, integer) RENAME TO claim_task_original;
+        CREATE FUNCTION absurd.claim_task(p_queue_name text, p_worker_id text, p_claim_timeout integer, p_qty integer)
+        RETURNS TABLE(run_id uuid, task_id uuid, attempt integer, task_name text, params jsonb, retry_strategy jsonb, max_attempts integer, headers jsonb, wake_event text, event_payload jsonb)
+        LANGUAGE plpgsql AS $$ BEGIN
+            INSERT INTO public.claim_calls(qty) VALUES (p_qty);
+            RETURN QUERY SELECT * FROM absurd.claim_task_original(p_queue_name, p_worker_id, p_claim_timeout, p_qty);
+        END $$;
+    "#).execute(client.pool()).await?;
+    Ok(())
+}
+
+/// Verifies a full worker does not issue even empty or zero-sized claim queries.
+#[tokio::test]
+async fn worker_does_not_query_claims_at_capacity() -> TestResult {
+    let test = setup().await?;
+    observe_claim_queries(&test.client).await?;
+    let release = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = observed_task(vec![release.clone(), release.clone()], sender)?;
+    for index in 0..5 {
+        test.client.spawn(&task, index).send().await?;
+    }
+    let scenario = async {
+        let _stop = shutdown.clone().drop_guard();
+        let _release = release.clone().drop_guard();
+        let mut started = [
+            next_started(&mut receiver).await?,
+            next_started(&mut receiver).await?,
+        ];
+        started.sort();
+        assert_eq!(started, [0, 1]);
+        for _ in 0..2 {
+            let calls: Vec<i32> =
+                sqlx::query_scalar("SELECT qty FROM public.claim_calls ORDER BY id")
+                    .fetch_all(test.client.pool())
+                    .await?;
+            assert_eq!(calls, vec![2]);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    };
+    worker_scenario(
+        &test,
+        Router::new().task(task)?,
+        WorkerOptions {
+            concurrency: 2,
+            claim: elephant::worker::ClaimOptions {
+                batch_size: 8,
+                empty_poll_delay: Duration::from_millis(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &shutdown,
+        scenario,
+    )
+    .await
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
