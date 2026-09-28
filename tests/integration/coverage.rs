@@ -1705,6 +1705,42 @@ async fn event_timeout_resumes_and_cleans_wait() -> TestResult {
     Ok(())
 }
 
+/// Verifies a single event wakes every registered task independently.
+#[tokio::test]
+async fn event_broadcast_wakes_all_waiters() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<i32, (i32, String)>::builder("broadcast")?
+        .handler(
+            |context, value| async move { Ok((value, context.await_event("broadcast").await?)) },
+        )
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let mut spawned = Vec::new();
+    for value in 0..3 {
+        spawned.push(test.client.spawn(&task, value).send().await?);
+        work_batch(&test.client, &router, "default").await?;
+    }
+    let waits: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.w_default")
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(waits, 3);
+    test.client
+        .emit_event("default", "broadcast", &"payload")
+        .await?;
+    for _ in 0..3 {
+        work_batch(&test.client, &router, "default").await?;
+    }
+    for (index, spawned) in spawned.iter().enumerate() {
+        assert_eq!(
+            spawned
+                .await_result(&test.client, Some(Duration::from_secs(1)))
+                .await?,
+            (i32::try_from(index)?, "payload".into())
+        );
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
