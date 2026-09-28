@@ -1509,10 +1509,15 @@ async fn sleep_preserves_deadline_and_run_identity() -> TestResult {
         let handler_calls = calls.clone();
         let task = Task::<(), ()>::builder("sleep-identity")?
             .handler(move |context, ()| {
-                handler_calls.fetch_add(1, Ordering::SeqCst);
+                let invocation = handler_calls.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if absolute {
-                        context.sleep_until_named("sleep", wake).await
+                        let requested = if invocation == 0 {
+                            wake
+                        } else {
+                            wake.saturating_add(Duration::from_secs(60))?
+                        };
+                        context.sleep_until_named("sleep", requested).await
                     } else {
                         context
                             .sleep_for_named("sleep", Duration::from_secs(10))
