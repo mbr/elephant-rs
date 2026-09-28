@@ -255,6 +255,30 @@ async fn idempotent_spawns_execute_once() -> TestResult {
     Ok(())
 }
 
+/// Verifies distinct keys and absent keys create independent tasks.
+#[tokio::test]
+async fn distinct_and_absent_idempotency_keys() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("independent")?.build();
+    let mut ids = Vec::new();
+    for key in [Some("one"), Some("two"), None, None] {
+        let mut spawn = test.client.spawn(&task, ());
+        if let Some(key) = key {
+            spawn = spawn.idempotency_key(key);
+        }
+        let spawned = spawn.send().await?;
+        assert!(spawned.result.created);
+        assert_eq!(spawned.result.attempt, 1);
+        assert!(!ids.contains(&spawned.result.task_id));
+        ids.push(spawned.result.task_id);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.t_default")
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(count, 4);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
