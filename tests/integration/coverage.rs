@@ -682,6 +682,44 @@ async fn durable_cancellation_policies() -> TestResult {
     Ok(())
 }
 
+/// Verifies cancellation terminates pending and running task/run pairs.
+#[tokio::test]
+async fn cancellation_terminal_database_state() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("cancel-state")?.build();
+    for running in [false, true] {
+        let spawned = test.client.spawn(&task, ()).send().await?;
+        let leases = if running {
+            test.client
+                .claim_task("default", &Default::default())
+                .await?
+        } else {
+            Vec::new()
+        };
+        assert_eq!(leases.len(), usize::from(running));
+        test.client
+            .cancel_task("default", spawned.result.task_id.as_uuid())
+            .await?;
+        let row = task_row(&test.client, spawned.result.task_id).await?;
+        assert_eq!(row["state"], "cancelled");
+        assert!(!row["cancelled_at"].is_null());
+        assert_eq!(
+            run_row(&test.client, spawned.result.run_id).await?["state"],
+            "cancelled"
+        );
+        assert!(
+            test.client
+                .claim_task("default", &Default::default())
+                .await?
+                .is_empty()
+        );
+        for lease in leases {
+            lease.forget();
+        }
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
