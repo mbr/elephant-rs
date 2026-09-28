@@ -867,6 +867,95 @@ async fn cancellation_blocks_checkpoint_and_event_writes() -> TestResult {
     Ok(())
 }
 
+/// Verifies terminal races preserve database state without failing dispatch.
+#[tokio::test]
+async fn dispatch_preserves_external_terminal_states() -> TestResult {
+    let test = setup().await?;
+    let observed = Arc::new(AtomicUsize::new(0));
+    let handler_observed = observed.clone();
+    let task = Task::<u8, ()>::builder("terminal-races")?
+        .default_max_attempts(1)
+        .handler(move |context, case| {
+            let observed = handler_observed.clone();
+            async move {
+                let metadata = context.metadata();
+                if case < 3 {
+                    context
+                        .client()
+                        .fail_run(
+                            "default",
+                            metadata.run_id.as_uuid(),
+                            serde_json::json!({"message": "external failure"}),
+                        )
+                        .await?;
+                } else {
+                    context
+                        .client()
+                        .cancel_task("default", metadata.task_id.as_uuid())
+                        .await?;
+                }
+                let result = match case {
+                    0 => context.heartbeat(Duration::from_secs(60)).await,
+                    1 => context.step("late", || async { Ok(1) }).await.map(|_| ()),
+                    4 => Err(Error::handler(Box::new(TestFailure))),
+                    _ => Ok(()),
+                };
+                let expected = if case < 2 {
+                    matches!(result, Err(Error::RunAlreadyFailed))
+                } else if case == 4 {
+                    matches!(result, Err(Error::Handler { .. }))
+                } else {
+                    result.is_ok()
+                };
+                if expected {
+                    observed.fetch_or(1 << case, Ordering::SeqCst);
+                }
+                result
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    for case in 0..5 {
+        let spawned = test.client.spawn(&task, case).send().await?;
+        let lease = test
+            .client
+            .claim_task("default", &Default::default())
+            .await?
+            .pop()
+            .expect("claim");
+        router
+            .dispatch_with(
+                lease,
+                elephant::run::ExecutionOptions {
+                    lease_renewal: elephant::run::LeaseRenewal::Disabled,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let expected = if case < 3 { "failed" } else { "cancelled" };
+        assert_eq!(
+            task_row(&test.client, spawned.result.task_id).await?["state"],
+            expected
+        );
+        let run = run_row(&test.client, spawned.result.run_id).await?;
+        assert_eq!(run["state"], expected);
+        if case < 3 {
+            assert_eq!(
+                run["failure_reason"],
+                serde_json::json!({"message": "external failure"})
+            );
+        }
+        assert!(
+            test.client
+                .get_checkpoint("default", spawned.result.task_id.as_uuid(), "late", true)
+                .await?
+                .is_none()
+        );
+    }
+    assert_eq!(observed.load(Ordering::SeqCst), 31);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
