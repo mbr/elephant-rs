@@ -489,6 +489,20 @@ async fn positive_fixed_retry_backoff() -> TestResult {
     .await
 }
 
+/// Verifies exponential backoff grows across successive failed attempts.
+#[tokio::test]
+async fn exponential_retry_backoff() -> TestResult {
+    check_backoff(
+        RetryStrategy::Exponential {
+            base: Duration::from_secs(40),
+            factor: 2.0,
+            max: None,
+        },
+        &[40, 80],
+    )
+    .await
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
