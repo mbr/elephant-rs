@@ -997,6 +997,40 @@ async fn heartbeat_uses_requested_database_extension() -> TestResult {
     Ok(())
 }
 
+/// Verifies zero heartbeat extensions fail the task without modifying expiry.
+#[tokio::test]
+async fn zero_heartbeat_preserves_expiry_and_fails() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("zero-heartbeat")?
+        .default_max_attempts(1)
+        .handler(|context, ()| async move { context.heartbeat(Duration::ZERO).await })
+        .build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let lease = test
+        .client
+        .claim_task("default", &Default::default())
+        .await?
+        .pop()
+        .expect("claim");
+    let before = run_row(&test.client, spawned.result.run_id).await?;
+    Router::new().task(task)?.dispatch(lease).await?;
+    let after = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(after["claim_expires_at"], before["claim_expires_at"]);
+    assert_eq!(after["state"], "failed");
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "failed"
+    );
+    assert!(
+        after["failure_reason"]["message"]
+            .as_str()
+            .expect("failure message")
+            .contains("extend_by must be > 0")
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
