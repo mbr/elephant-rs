@@ -1917,6 +1917,65 @@ async fn execution_wrapper_order_and_identity() -> TestResult {
     Ok(())
 }
 
+tokio::task_local! {
+    /// Carries application tracing context independently of the SDK.
+    static CARRIER: String;
+}
+
+/// Restores application task-local context around handler execution.
+fn carrier_router(router: Router) -> Router {
+    router.wrap_execution(|context, execute| async move {
+        let carrier = context
+            .metadata()
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("trace"))
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        CARRIER.scope(carrier, execute).await
+    })
+}
+
+/// Enqueues a task with the caller's application-owned context carrier.
+async fn enqueue_carrier<P: serde::Serialize, R>(
+    client: &Client,
+    task: &Task<P, R>,
+    params: P,
+) -> elephant::error::Result<elephant::types::Spawned<R>> {
+    client
+        .spawn(task, params)
+        .headers(serde_json::json!({"trace": CARRIER.with(Clone::clone)}))?
+        .send()
+        .await
+}
+
+/// Verifies header extraction establishes async context only while executing.
+#[tokio::test]
+async fn execution_wrapper_restores_application_context() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), String>::builder("carrier")?
+        .handler(|_, ()| async {
+            tokio::task::yield_now().await;
+            Ok(CARRIER.with(Clone::clone))
+        })
+        .build();
+    let spawned = CARRIER
+        .scope("trace-7".into(), enqueue_carrier(&test.client, &task, ()))
+        .await?;
+    assert!(CARRIER.try_with(Clone::clone).is_err());
+    let router = carrier_router(Router::new().task(task)?);
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        "trace-7"
+    );
+    assert!(CARRIER.try_with(Clone::clone).is_err());
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
