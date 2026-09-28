@@ -1376,6 +1376,68 @@ async fn router_rejects_mismatched_claim_queue() -> TestResult {
     Ok(())
 }
 
+/// Verifies failed step bodies leave no checkpoint and execute again on retry.
+#[tokio::test]
+async fn failed_step_is_reexecuted() -> TestResult {
+    let test = setup().await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let task = Task::<(), usize>::builder("failed-step")?
+        .default_max_attempts(2)
+        .handler(move |context, ()| {
+            let calls = handler_calls.clone();
+            async move {
+                context
+                    .step("fallible", || async {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(Error::handler(Box::new(TestFailure)))
+                        } else {
+                            Ok(42)
+                        }
+                    })
+                    .await
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        test.client
+            .get_checkpoint(
+                "default",
+                spawned.result.task_id.as_uuid(),
+                "fallible",
+                true
+            )
+            .await?
+            .is_none()
+    );
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        42
+    );
+    assert_eq!(
+        test.client
+            .get_checkpoint(
+                "default",
+                spawned.result.task_id.as_uuid(),
+                "fallible",
+                true
+            )
+            .await?
+            .expect("successful checkpoint")
+            .state,
+        42
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
