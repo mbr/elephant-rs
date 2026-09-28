@@ -197,6 +197,64 @@ async fn retry_limit_precedence() -> TestResult {
     Ok(())
 }
 
+/// Verifies duplicate idempotency keys create one task and execute one handler.
+#[tokio::test]
+async fn idempotent_spawns_execute_once() -> TestResult {
+    let test = setup().await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let task = Task::<i32, i32>::builder("once")?
+        .handler(move |_, value| {
+            handler_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(value) }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let first = test
+        .client
+        .spawn(&task, 1)
+        .idempotency_key("key")
+        .send()
+        .await?;
+    assert!(first.result.created);
+    assert_eq!(first.result.attempt, 1);
+    assert_eq!(
+        task_row(&test.client, first.result.task_id).await?["state"],
+        "pending"
+    );
+    for value in [2, 3] {
+        let duplicate = test
+            .client
+            .spawn(&task, value)
+            .idempotency_key("key")
+            .send()
+            .await?;
+        assert_eq!(
+            duplicate.result,
+            elephant::types::SpawnResult {
+                created: false,
+                ..first.result
+            }
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.t_default")
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(count, 1);
+    for _ in 0..3 {
+        work_batch(&test.client, &router, "default").await?;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let snapshot = test
+        .client
+        .fetch_task_result("default", first.result.task_id.as_uuid())
+        .await?
+        .expect("task");
+    assert_eq!(snapshot.state, TaskResultState::Completed);
+    assert_eq!(snapshot.result, Some(serde_json::json!(1)));
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
