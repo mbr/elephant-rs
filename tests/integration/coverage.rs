@@ -2350,6 +2350,97 @@ async fn worker_shutdown_leaves_backlog_unclaimed() -> TestResult {
     Ok(())
 }
 
+/// Verifies panic and ordinary failure do not stop peers or subsequent worker claims.
+#[tokio::test]
+async fn worker_survives_handler_failures() -> TestResult {
+    let test = setup().await?;
+    observe_claim_queries(&test.client).await?;
+    let release = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let handler_release = release.clone();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = Task::<usize, usize>::builder("mixed")?
+        .default_max_attempts(1)
+        .handler(move |_, index| {
+            let release = handler_release.clone();
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(index)
+                    .map_err(|error| Error::handler(Box::new(error)))?;
+                release.cancelled().await;
+                match index {
+                    0 => panic!("worker handler panic"),
+                    1 => Err(Error::handler(Box::new(TestFailure))),
+                    _ => Ok(index),
+                }
+            }
+        })
+        .build();
+    let mut spawned = Vec::new();
+    for index in 0..3 {
+        spawned.push(test.client.spawn(&task, index).send().await?);
+    }
+    let scenario = async {
+        let _stop = shutdown.clone().drop_guard();
+        let _release = release.clone().drop_guard();
+        let mut started = [
+            next_started(&mut receiver).await?,
+            next_started(&mut receiver).await?,
+            next_started(&mut receiver).await?,
+        ];
+        started.sort();
+        assert_eq!(started, [0, 1, 2]);
+        let calls: Vec<i32> = sqlx::query_scalar("SELECT qty FROM public.claim_calls ORDER BY id")
+            .fetch_all(test.client.pool())
+            .await?;
+        assert_eq!(calls, vec![3]);
+        release.cancel();
+        for (index, handle) in spawned.iter().enumerate() {
+            let snapshot = test
+                .client
+                .await_task_result(
+                    "default",
+                    handle.result.task_id.as_uuid(),
+                    Some(Duration::from_secs(2)),
+                )
+                .await?;
+            if index < 2 {
+                assert_eq!(snapshot.state, TaskResultState::Failed);
+                assert_eq!(
+                    snapshot.failure.expect("failure")["name"],
+                    if index == 0 { "panic" } else { "handler_error" }
+                );
+            } else {
+                assert_eq!(snapshot.result, Some(serde_json::json!(2)));
+            }
+        }
+        let later = test.client.spawn(&task, 3).send().await?;
+        assert_eq!(
+            later
+                .await_result(&test.client, Some(Duration::from_secs(2)))
+                .await?,
+            3
+        );
+        Ok(())
+    };
+    worker_scenario(
+        &test,
+        Router::new().task(task.clone())?,
+        WorkerOptions {
+            concurrency: 3,
+            claim: elephant::worker::ClaimOptions {
+                batch_size: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &shutdown,
+        scenario,
+    )
+    .await
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
