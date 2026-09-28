@@ -1576,6 +1576,49 @@ async fn sleep_preserves_deadline_and_run_identity() -> TestResult {
     Ok(())
 }
 
+/// Verifies event registration suspends indefinitely and emission makes it pending.
+#[tokio::test]
+async fn event_registration_state_transitions() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), i32>::builder("event-state")?
+        .handler(|context, ()| async move { context.await_event("event").await })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "sleeping"
+    );
+    let sleeping = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(sleeping["state"], "sleeping");
+    assert_eq!(sleeping["wake_event"], "event");
+    assert_eq!(sleeping["available_at"], "infinity");
+    let unlimited: bool =
+        sqlx::query_scalar("SELECT timeout_at IS NULL FROM absurd.w_default WHERE task_id = $1")
+            .bind(spawned.result.task_id.as_uuid())
+            .fetch_one(test.client.pool())
+            .await?;
+    assert!(unlimited);
+    test.client.emit_event("default", "event", &42).await?;
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "pending"
+    );
+    assert_eq!(
+        run_row(&test.client, spawned.result.run_id).await?["state"],
+        "pending"
+    );
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        42
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
