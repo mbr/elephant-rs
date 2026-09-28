@@ -16,9 +16,11 @@ use elephant::{
         CancellationPolicy, CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions,
         QueueStorageMode, RetryStrategy, TaskId, TaskResultState,
     },
-    worker::work_batch,
+    worker::{WorkerOptions, run_worker, work_batch},
 };
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::{TestFailure, TestResult, setup};
 
@@ -2062,6 +2064,95 @@ async fn optional_headers_round_trip() -> TestResult {
         );
     }
     Ok(())
+}
+
+/// Builds a handler reporting entry and waiting on input-indexed gates when present.
+fn observed_task(
+    gates: Vec<CancellationToken>,
+    started: mpsc::UnboundedSender<usize>,
+) -> elephant::error::Result<elephant::task::TaskRegistration<usize, usize>> {
+    let gates = Arc::new(gates);
+    Ok(Task::<usize, usize>::builder("observed")?
+        .handler(move |_, index| {
+            let gate = gates.get(index).cloned();
+            let started = started.clone();
+            async move {
+                started
+                    .send(index)
+                    .map_err(|error| Error::handler(Box::new(error)))?;
+                if let Some(gate) = gate {
+                    gate.cancelled().await;
+                }
+                Ok(index)
+            }
+        })
+        .build())
+}
+
+/// Waits for a handler entry with a bounded failure deadline.
+async fn next_started(receiver: &mut mpsc::UnboundedReceiver<usize>) -> TestResult<usize> {
+    Ok(
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await?
+            .ok_or("worker channel closed")?,
+    )
+}
+
+/// Polls a worker and its controlling scenario without detached test tasks.
+async fn worker_scenario<F>(
+    test: &super::TestDb,
+    router: Router,
+    options: WorkerOptions,
+    shutdown: &CancellationToken,
+    scenario: F,
+) -> TestResult
+where
+    F: std::future::Future<Output = TestResult>,
+{
+    let (worker, scenario) = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::join!(
+            run_worker(test.client.clone(), router, options, shutdown.clone()),
+            scenario
+        )
+    })
+    .await?;
+    worker?;
+    scenario
+}
+
+/// Verifies both available worker slots enter their handlers before either finishes.
+#[tokio::test]
+async fn worker_executes_both_slots_concurrently() -> TestResult {
+    let test = setup().await?;
+    let release = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = observed_task(vec![release.clone(), release.clone()], sender)?;
+    for index in 0..2 {
+        test.client.spawn(&task, index).send().await?;
+    }
+    let scenario = async {
+        let _stop = shutdown.clone().drop_guard();
+        let _release = release.clone().drop_guard();
+        let mut started = [
+            next_started(&mut receiver).await?,
+            next_started(&mut receiver).await?,
+        ];
+        started.sort();
+        assert_eq!(started, [0, 1]);
+        Ok(())
+    };
+    worker_scenario(
+        &test,
+        Router::new().task(task)?,
+        WorkerOptions {
+            concurrency: 2,
+            ..Default::default()
+        },
+        &shutdown,
+        scenario,
+    )
+    .await
 }
 
 /// Verifies listing and dropping queues also removes their physical tables.

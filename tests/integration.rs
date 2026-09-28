@@ -48,7 +48,7 @@ struct Output {
 }
 
 /// Represents fallible test completion.
-type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
+type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
 
 /// Owns an ephemeral test database.
 struct TestDb {
