@@ -1,8 +1,11 @@
 //! Behavioral coverage shared with the upstream SDK suites.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use elephant::{
@@ -11,7 +14,7 @@ use elephant::{
     task::{Router, Task},
     types::{
         CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions, QueueStorageMode,
-        TaskId, TaskResultState,
+        RetryStrategy, TaskId, TaskResultState,
     },
     worker::work_batch,
 };
@@ -410,6 +413,80 @@ async fn immediate_retry_exhaustion_preserves_runs() -> TestResult {
             .is_empty()
     );
     Ok(())
+}
+
+/// Sets deterministic database time on a single-connection test pool.
+async fn clock(client: &Client, seconds: i32) -> elephant::error::Result<()> {
+    sqlx::query("SELECT set_config('absurd.fake_now', (timestamptz '2025-01-01 00:00:00Z' + make_interval(secs => $1::double precision))::text, false)")
+        .bind(f64::from(seconds)).execute(client.pool()).await?;
+    Ok(())
+}
+
+/// Exercises scheduled retries before and at each configured backoff deadline.
+async fn check_backoff(strategy: RetryStrategy, delays: &[i32]) -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let limit = i32::try_from(delays.len())? + 1;
+    let task = Task::<(), i32>::builder("backoff")?
+        .default_max_attempts(limit)
+        .handler(move |context, ()| async move {
+            if context.metadata().attempt < limit {
+                Err(Error::handler(Box::new(TestFailure)))
+            } else {
+                Ok(context.metadata().attempt)
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test
+        .client
+        .spawn(&task, ())
+        .retry_strategy(strategy.clone())
+        .send()
+        .await?;
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["retry_strategy"],
+        strategy.to_json()
+    );
+    let mut now = 0;
+    for (index, delay) in delays.iter().copied().enumerate() {
+        work_batch(&test.client, &router, "default").await?;
+        let row = task_row(&test.client, spawned.result.task_id).await?;
+        assert_eq!(row["state"], "sleeping");
+        assert_eq!(row["attempts"], index + 2);
+        let remaining: f64 = sqlx::query_scalar("SELECT extract(epoch FROM available_at - absurd.current_time())::float8 FROM absurd.r_default WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1")
+            .bind(spawned.result.task_id.as_uuid()).fetch_one(test.client.pool()).await?;
+        assert_eq!(remaining, f64::from(delay));
+        clock(&test.client, now + delay - 1).await?;
+        assert!(
+            test.client
+                .claim_task("default", &Default::default())
+                .await?
+                .is_empty()
+        );
+        now += delay;
+        clock(&test.client, now).await?;
+    }
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        limit
+    );
+    Ok(())
+}
+
+/// Verifies a positive fixed delay is persisted and enforced before retry.
+#[tokio::test]
+async fn positive_fixed_retry_backoff() -> TestResult {
+    check_backoff(
+        RetryStrategy::Fixed {
+            base: Duration::from_secs(10),
+        },
+        &[10],
+    )
+    .await
 }
 
 /// Verifies listing and dropping queues also removes their physical tables.
