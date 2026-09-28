@@ -1976,6 +1976,57 @@ async fn execution_wrapper_restores_application_context() -> TestResult {
     Ok(())
 }
 
+/// Verifies application enqueue wrappers propagate parent context to children.
+#[tokio::test]
+async fn child_inherits_application_carrier() -> TestResult {
+    let test = setup().await?;
+    test.client
+        .create_queue("child", CreateQueueOptions::default())
+        .await?;
+    let child = Task::<(), String>::builder("carrier-child")?
+        .queue("child")?
+        .handler(|_, ()| async { Ok(CARRIER.with(Clone::clone)) })
+        .build();
+    let child_contract = child.clone();
+    let parent = Task::<(), elephant::types::Spawned<String>>::builder("carrier-parent")?
+        .handler(move |context, ()| {
+            let child = child_contract.clone();
+            async move { enqueue_carrier(context.client(), &child, ()).await }
+        })
+        .build();
+    let router = carrier_router(Router::new().task(parent.clone())?.task(child)?);
+    let parent = CARRIER
+        .scope(
+            "parent-trace".into(),
+            enqueue_carrier(&test.client, &parent, ()),
+        )
+        .await?;
+    work_batch(&test.client, &router, "default").await?;
+    let child = parent
+        .await_result(&test.client, Some(Duration::from_secs(1)))
+        .await?;
+    assert!(CARRIER.try_with(Clone::clone).is_err());
+    let lease = test
+        .client
+        .claim_task("child", &Default::default())
+        .await?
+        .pop()
+        .expect("child claim");
+    assert_eq!(
+        lease.claimed_run().headers,
+        Some(serde_json::json!({"trace": "parent-trace"}))
+    );
+    router.dispatch(lease).await?;
+    assert_eq!(
+        child
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        "parent-trace"
+    );
+    assert!(CARRIER.try_with(Clone::clone).is_err());
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
