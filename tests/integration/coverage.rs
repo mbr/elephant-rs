@@ -1296,6 +1296,33 @@ async fn unknown_deferral_preserves_attempt_and_failure_state() -> TestResult {
     Ok(())
 }
 
+/// Verifies unknown-task scheduling failures retain their cause and recoverable lease.
+#[tokio::test]
+async fn unknown_deferral_preserves_database_error() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("unregistered")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    sqlx::query("CREATE OR REPLACE FUNCTION absurd.schedule_run(p_queue_name text, p_run_id uuid, p_wake_at timestamptz) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'XX000', MESSAGE = 'deferral unavailable'; END $$")
+        .execute(test.client.pool()).await?;
+    let error = work_batch(&test.client, &Router::new(), "default")
+        .await
+        .expect_err("scheduling failure");
+    let Error::Sqlx { source } = error else {
+        panic!("unexpected error: {error:?}")
+    };
+    let database = source.as_database_error().expect("database source");
+    assert_eq!(database.code().as_deref(), Some("XX000"));
+    assert_eq!(database.message(), "deferral unavailable");
+    let task = task_row(&test.client, spawned.result.task_id).await?;
+    let run = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(task["state"], "running");
+    assert_eq!(task["attempts"], 1);
+    assert_eq!(run["state"], "running");
+    assert!(run["failure_reason"].is_null());
+    assert!(!run["claim_expires_at"].is_null());
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
