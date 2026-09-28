@@ -196,7 +196,11 @@ signal; it does not hold a worker slot until wakeup.
 separate event identity from checkpoint identity. Events are immutable per queue
 and name: the first emit wins. Repeated waits for one name do not represent a
 stream of successive events. Missing timeout payloads and JSON null payloads
-remain distinguishable.
+remain distinguishable. On timeout resumption, the first uncached wait for that
+event raises `Error::EventTimeout`. If the handler catches it and waits for the
+same event again within that dispatch, the next wait acknowledges the database
+timeout marker with JSON null instead of suspending again. This acknowledgement
+is not an emitted event, a persisted checkpoint, or durable application progress.
 
 `await_task_result` and its named variant poll another queue while retaining a
 worker slot. They explicitly heartbeat to maintain the claim and report continued

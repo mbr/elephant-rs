@@ -55,6 +55,8 @@ pub struct TaskContext {
     checkpoints: Arc<Mutex<HashMap<String, Value>>>,
     /// Counts each base name's occurrences within this execution.
     checkpoint_counts: Arc<Mutex<HashMap<String, usize>>>,
+    /// Carries an event timeout to deliver once across context clones.
+    pending_event_timeout: Arc<Mutex<Option<String>>>,
     /// Carries the claim extension used by checkpoint writes.
     checkpoint_extend_by: Option<Duration>,
 }
@@ -77,6 +79,11 @@ impl TaskContext {
             activity: None,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
             checkpoint_counts: Arc::default(),
+            pending_event_timeout: Arc::new(Mutex::new(
+                run.wake_event
+                    .clone()
+                    .filter(|_| run.event_payload.is_none()),
+            )),
             checkpoint_extend_by: Some(run.claim_timeout),
         }
     }
@@ -241,6 +248,16 @@ impl TaskContext {
         if let Some(payload) = self.checkpoint_value(step_name.as_str()) {
             return serde_json::from_value(payload).map_err(Error::json);
         }
+        {
+            let mut pending_timeout = self
+                .pending_event_timeout
+                .lock()
+                .expect("event timeout lock poisoned");
+            if pending_timeout.as_deref() == Some(event_name.as_str()) {
+                pending_timeout.take();
+                return Err(Error::EventTimeout);
+            }
+        }
         let raw = self
             .client
             .await_event_raw(
@@ -255,12 +272,12 @@ impl TaskContext {
         if raw.should_suspend {
             return Err(Error::Suspended);
         }
-        let payload = match raw.payload {
-            Some(payload) => payload,
-            None => return Err(Error::EventTimeout),
-        };
+        let persisted = raw.payload.is_some();
+        let payload = raw.payload.unwrap_or(Value::Null);
         self.insert_checkpoint(step_name.as_str(), payload.clone());
-        self.record_progress(None);
+        if persisted {
+            self.record_progress(None);
+        }
         serde_json::from_value(payload).map_err(Error::json)
     }
 

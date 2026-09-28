@@ -1741,6 +1741,59 @@ async fn event_broadcast_wakes_all_waiters() -> TestResult {
     Ok(())
 }
 
+/// Verifies repeated waits acknowledge a resumed timeout without recreating the wait.
+#[tokio::test]
+async fn repeated_wait_after_timeout_does_not_resuspend() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let timeouts = Arc::new(AtomicUsize::new(0));
+    let handler_timeouts = timeouts.clone();
+    let task = Task::<(), Value>::builder("repeat-timeout")?
+        .handler(move |context, ()| {
+            let timeouts = handler_timeouts.clone();
+            async move {
+                let second = context.clone();
+                match context
+                    .await_event_named_with_timeout::<Value>(
+                        "wait",
+                        "missing",
+                        Some(Duration::from_secs(10)),
+                    )
+                    .await
+                {
+                    Err(Error::EventTimeout) => {
+                        timeouts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(error) => return Err(error),
+                    Ok(value) => return Ok(value),
+                }
+                second.await_event_named("wait", "missing").await
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    clock(&test.client, 10).await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(timeouts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "completed"
+    );
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        Value::Null
+    );
+    let waits: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.w_default")
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(waits, 0);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
