@@ -772,6 +772,40 @@ async fn terminal_task_cancellation_is_noop() -> TestResult {
     Ok(())
 }
 
+/// Verifies cancellation terminates an event-suspended run.
+#[tokio::test]
+async fn cancel_event_suspended_task() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("sleeping-cancel")?
+        .handler(|context, ()| async move { context.await_event("never").await })
+        .build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &Router::new().task(task)?, "default").await?;
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "sleeping"
+    );
+    test.client
+        .cancel_task("default", spawned.result.task_id.as_uuid())
+        .await?;
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["state"],
+        "cancelled"
+    );
+    assert_eq!(
+        run_row(&test.client, spawned.result.run_id).await?["state"],
+        "cancelled"
+    );
+    test.client.emit_event("default", "never", &()).await?;
+    assert!(
+        test.client
+            .claim_task("default", &Default::default())
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
