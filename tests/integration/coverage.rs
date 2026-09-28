@@ -1496,6 +1496,86 @@ async fn partial_workflow_executes_unfinished_suffix() -> TestResult {
     Ok(())
 }
 
+/// Verifies absolute and relative sleeps preserve checkpoint ownership and run identity.
+#[tokio::test]
+async fn sleep_preserves_deadline_and_run_identity() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    let wake = "2025-01-01T00:00:10Z".parse::<jiff::Timestamp>()?;
+    for absolute in [false, true] {
+        clock(&test.client, 0).await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let task = Task::<(), ()>::builder("sleep-identity")?
+            .handler(move |context, ()| {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if absolute {
+                        context.sleep_until_named("sleep", wake).await
+                    } else {
+                        context
+                            .sleep_for_named("sleep", Duration::from_secs(10))
+                            .await
+                    }
+                }
+            })
+            .build();
+        let router = Router::new().task(task.clone())?;
+        let spawned = test.client.spawn(&task, ()).send().await?;
+        work_batch(&test.client, &router, "default").await?;
+        let checkpoint = test
+            .client
+            .get_checkpoint("default", spawned.result.task_id.as_uuid(), "sleep", true)
+            .await?
+            .expect("sleep checkpoint");
+        assert_eq!(checkpoint.owner_run_id, Some(spawned.result.run_id));
+        assert_eq!(
+            checkpoint
+                .state
+                .as_str()
+                .expect("timestamp")
+                .parse::<jiff::Timestamp>()?,
+            wake
+        );
+        let scheduled = run_row(&test.client, spawned.result.run_id).await?;
+        assert_eq!(scheduled["state"], "sleeping");
+        assert_eq!(
+            scheduled["available_at"]
+                .as_str()
+                .expect("availability")
+                .parse::<jiff::Timestamp>()?,
+            wake
+        );
+        assert_eq!(
+            task_row(&test.client, spawned.result.task_id).await?["state"],
+            "sleeping"
+        );
+        clock(&test.client, 10).await?;
+        let lease = test
+            .client
+            .claim_task("default", &Default::default())
+            .await?
+            .pop()
+            .expect("woken run");
+        assert_eq!(lease.claimed_run().run_id, spawned.result.run_id);
+        assert_eq!(lease.claimed_run().attempt, 1);
+        let resumed = run_row(&test.client, spawned.result.run_id).await?;
+        assert_eq!(
+            resumed["started_at"]
+                .as_str()
+                .expect("start")
+                .parse::<jiff::Timestamp>()?,
+            wake
+        );
+        router.dispatch(lease).await?;
+        assert_eq!(
+            task_row(&test.client, spawned.result.task_id).await?["state"],
+            "completed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
