@@ -956,6 +956,47 @@ async fn dispatch_preserves_external_terminal_states() -> TestResult {
     Ok(())
 }
 
+/// Verifies explicit context heartbeats forward their full lease extension.
+#[tokio::test]
+async fn heartbeat_uses_requested_database_extension() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("heartbeat-extension")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let lease = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                claim_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("claim");
+    let original = run_row(&test.client, spawned.result.run_id).await?;
+    clock(&test.client, 1).await?;
+    let context = elephant::context::TaskContext::new(
+        test.client.clone(),
+        lease.claimed_run(),
+        Default::default(),
+    );
+    context.heartbeat(Duration::from_secs(120)).await?;
+    let updated = run_row(&test.client, spawned.result.run_id).await?;
+    let before = original["claim_expires_at"]
+        .as_str()
+        .expect("expiry")
+        .parse::<jiff::Timestamp>()?;
+    let after = updated["claim_expires_at"]
+        .as_str()
+        .expect("expiry")
+        .parse::<jiff::Timestamp>()?;
+    assert_eq!(after.duration_since(before).as_secs(), 61);
+    lease.complete(()).await?;
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
