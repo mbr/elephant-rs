@@ -740,6 +740,38 @@ async fn cancellation_is_idempotent() -> TestResult {
     Ok(())
 }
 
+/// Verifies cancellation leaves successful and failed tasks unchanged.
+#[tokio::test]
+async fn terminal_task_cancellation_is_noop() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<bool, ()>::builder("terminal-cancel")?
+        .default_max_attempts(1)
+        .handler(|_, fail| async move {
+            if fail {
+                Err(Error::handler(Box::new(TestFailure)))
+            } else {
+                Ok(())
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    for (fail, state) in [(false, "completed"), (true, "failed")] {
+        let spawned = test.client.spawn(&task, fail).send().await?;
+        work_batch(&test.client, &router, "default").await?;
+        let before = task_row(&test.client, spawned.result.task_id).await?;
+        assert_eq!(before["state"], state);
+        assert!(before["cancelled_at"].is_null());
+        test.client
+            .cancel_task("default", spawned.result.task_id.as_uuid())
+            .await?;
+        assert_eq!(
+            task_row(&test.client, spawned.result.task_id).await?,
+            before
+        );
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
