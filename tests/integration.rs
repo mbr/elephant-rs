@@ -1,5 +1,8 @@
 //! Integration tests against ephemeral PostgreSQL.
 
+#[path = "integration/coverage.rs"]
+mod coverage;
+
 use std::{
     collections::BTreeMap,
     error::Error as StdError,
