@@ -551,6 +551,72 @@ async fn manual_retry_extends_exhausted_task() -> TestResult {
     Ok(())
 }
 
+/// Verifies retry-as-new leaves the original task and checkpoints behind.
+#[tokio::test]
+async fn retry_as_new_discards_checkpoints() -> TestResult {
+    let test = setup().await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let task = Task::<(), ()>::builder("fresh-retry")?
+        .default_max_attempts(1)
+        .handler(move |context, ()| {
+            let calls = handler_calls.clone();
+            async move {
+                context
+                    .step("effect", || async {
+                        Ok(calls.fetch_add(1, Ordering::SeqCst))
+                    })
+                    .await?;
+                Err(Error::handler(Box::new(TestFailure)))
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let original = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert!(
+        test.client
+            .get_checkpoint("default", original.result.task_id.as_uuid(), "effect", true)
+            .await?
+            .is_some()
+    );
+    let retried = test
+        .client
+        .retry_task(
+            "default",
+            original.result.task_id.as_uuid(),
+            elephant::types::RetryTaskOptions {
+                spawn_new: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(retried.created);
+    assert_ne!(retried.task_id, original.result.task_id);
+    assert_eq!(retried.attempt, 1);
+    assert_eq!(
+        task_row(&test.client, retried.task_id).await?["state"],
+        "pending"
+    );
+    assert!(
+        test.client
+            .get_checkpoints(
+                "default",
+                retried.task_id.as_uuid(),
+                retried.run_id.as_uuid()
+            )
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        task_row(&test.client, original.result.task_id).await?["state"],
+        "failed"
+    );
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
