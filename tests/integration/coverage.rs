@@ -29,6 +29,19 @@ async fn task_row(client: &Client, task_id: TaskId) -> elephant::error::Result<V
     )
 }
 
+/// Reads a run's persisted fields from the default queue.
+async fn run_row(
+    client: &Client,
+    run_id: elephant::types::RunId,
+) -> elephant::error::Result<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(r) FROM absurd.r_default r WHERE run_id = $1")
+            .bind(run_id.as_uuid())
+            .fetch_one(client.pool())
+            .await?,
+    )
+}
+
 /// Verifies partitioned queue options produce the expected relation kinds.
 #[tokio::test]
 async fn partitioned_queue_relations() -> TestResult {
@@ -354,6 +367,48 @@ async fn idempotency_keys_are_queue_scoped() -> TestResult {
             TaskResultState::Pending
         );
     }
+    Ok(())
+}
+
+/// Verifies immediate retry state accounting and preservation of failed runs.
+#[tokio::test]
+async fn immediate_retry_exhaustion_preserves_runs() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("exhaust")?
+        .default_max_attempts(2)
+        .handler(|_, ()| async { Err(Error::handler(Box::new(TestFailure))) })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    let pending = task_row(&test.client, spawned.result.task_id).await?;
+    assert_eq!(pending["state"], "pending");
+    assert_eq!(pending["attempts"], 2);
+    let first = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(first["state"], "failed");
+    assert_eq!(
+        first["failure_reason"]["message"],
+        "intentional test failure"
+    );
+    let lease = test
+        .client
+        .claim_task("default", &Default::default())
+        .await?
+        .pop()
+        .expect("retry");
+    assert_eq!(lease.claimed_run().attempt, 2);
+    assert_ne!(lease.claimed_run().run_id, spawned.result.run_id);
+    router.dispatch(lease).await?;
+    let failed = task_row(&test.client, spawned.result.task_id).await?;
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["attempts"], 2);
+    assert_eq!(run_row(&test.client, spawned.result.run_id).await?, first);
+    assert!(
+        test.client
+            .claim_task("default", &Default::default())
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
