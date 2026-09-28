@@ -577,6 +577,16 @@ async fn sleep_schedules_relative_to_database_clock() -> TestResult {
     let delay = available_at.duration_since(database_now).as_secs_f64();
 
     assert!((9.0..=11.0).contains(&delay));
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        test.client
+            .fetch_task_result("default", spawned.result.task_id.as_uuid())
+            .await?
+            .expect("sleeping task")
+            .state,
+        TaskResultState::Sleeping
+    );
 
     let after_wakeup = database_now.saturating_add(Duration::from_secs(11))?;
     sqlx::query("SELECT set_config('absurd.fake_now', $1, false)")
