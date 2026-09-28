@@ -2441,6 +2441,153 @@ async fn worker_survives_handler_failures() -> TestResult {
     .await
 }
 
+/// Waits for a database-side fault marker that survives transaction rollback.
+async fn wait_for_database_flag(client: &Client, query: &str) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if sqlx::query_scalar::<_, bool>(query)
+                .fetch_one(client.pool())
+                .await?
+            {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+/// Verifies runtime claim and dispatch errors drain owned work before reaching callers.
+#[tokio::test]
+async fn worker_infrastructure_errors_drain_and_preserve_source() -> TestResult {
+    for dispatch_failure in [false, true] {
+        let test = setup().await?;
+        observe_claim_queries(&test.client).await?;
+        if dispatch_failure {
+            sqlx::raw_sql(r#"
+                CREATE SEQUENCE public.resolution_fault;
+                CREATE FUNCTION public.fail_resolution() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                    IF NEW.state = 'completed' AND EXISTS (
+                        SELECT 1 FROM absurd.t_default t WHERE t.task_id = NEW.task_id AND t.params = '0'::jsonb
+                    ) THEN
+                        PERFORM nextval('public.resolution_fault');
+                        RAISE EXCEPTION USING ERRCODE = 'XX000', MESSAGE = 'resolution unavailable';
+                    END IF;
+                    RETURN NEW;
+                END $$;
+                CREATE TRIGGER fail_resolution BEFORE UPDATE ON absurd.r_default
+                    FOR EACH ROW EXECUTE FUNCTION public.fail_resolution();
+            "#).execute(test.client.pool()).await?;
+        } else {
+            sqlx::raw_sql(
+                r#"
+                CREATE FUNCTION public.fail_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                    IF NEW.id > 1 THEN
+                        RAISE EXCEPTION USING ERRCODE = 'XX000', MESSAGE = 'claim unavailable';
+                    END IF;
+                    RETURN NEW;
+                END $$;
+                CREATE TRIGGER fail_claim BEFORE INSERT ON public.claim_calls
+                    FOR EACH ROW EXECUTE FUNCTION public.fail_claim();
+            "#,
+            )
+            .execute(test.client.pool())
+            .await?;
+        }
+        let release_first = CancellationToken::new();
+        let release_second = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let task = observed_task(vec![release_first.clone(), release_second.clone()], sender)?;
+        let count = if dispatch_failure { 2 } else { 1 };
+        let mut spawned = Vec::new();
+        for index in 0..count {
+            spawned.push(test.client.spawn(&task, index).send().await?);
+        }
+        let router = Router::new().task(task)?;
+        let worker = async {
+            let result = run_worker(
+                test.client.clone(),
+                router,
+                WorkerOptions {
+                    concurrency: 2,
+                    claim: elephant::worker::ClaimOptions {
+                        batch_size: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                shutdown.clone(),
+            )
+            .await;
+            finished.cancel();
+            result
+        };
+        let scenario = async {
+            let _stop = shutdown.clone().drop_guard();
+            let _first = release_first.clone().drop_guard();
+            let _second = release_second.clone().drop_guard();
+            let mut entered = Vec::new();
+            for _ in 0..count {
+                entered.push(next_started(&mut receiver).await?);
+            }
+            entered.sort();
+            assert_eq!(entered, (0..count).collect::<Vec<_>>());
+            let marker = if dispatch_failure {
+                release_first.cancel();
+                "SELECT is_called FROM public.resolution_fault"
+            } else {
+                "SELECT last_value > 1 FROM public.claim_calls_id_seq"
+            };
+            wait_for_database_flag(&test.client, marker).await?;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                !finished.is_cancelled(),
+                "worker returned before draining its healthy handler"
+            );
+            let healthy = &spawned[usize::from(dispatch_failure)];
+            assert_eq!(
+                task_row(&test.client, healthy.result.task_id).await?["state"],
+                "running"
+            );
+            TestResult::Ok(())
+        };
+        let (worker, scenario) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(worker, scenario)
+        })
+        .await?;
+        scenario?;
+        let error = worker.expect_err("infrastructure failure must reach caller");
+        let Error::Sqlx { source } = error else {
+            panic!("unexpected error: {error:?}")
+        };
+        let database = source.as_database_error().expect("database cause");
+        assert_eq!(database.code().as_deref(), Some("XX000"));
+        assert_eq!(
+            database.message(),
+            if dispatch_failure {
+                "resolution unavailable"
+            } else {
+                "claim unavailable"
+            }
+        );
+        let healthy = &spawned[usize::from(dispatch_failure)];
+        assert_eq!(
+            task_row(&test.client, healthy.result.task_id).await?["state"],
+            "completed"
+        );
+        if dispatch_failure {
+            let unresolved = run_row(&test.client, spawned[0].result.run_id).await?;
+            assert_eq!(unresolved["state"], "running");
+            assert!(unresolved["failure_reason"].is_null());
+            assert!(!unresolved["claim_expires_at"].is_null());
+        }
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
