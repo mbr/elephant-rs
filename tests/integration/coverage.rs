@@ -2027,6 +2027,43 @@ async fn child_inherits_application_carrier() -> TestResult {
     Ok(())
 }
 
+/// Verifies absent and heterogeneous headers survive spawn, claim, and dispatch.
+#[tokio::test]
+async fn optional_headers_round_trip() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), Option<Value>>::builder("optional-headers")?
+        .handler(|context, ()| async move { Ok(context.metadata().headers.clone()) })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    for expected in [
+        None,
+        Some(
+            serde_json::json!({"number": 42, "text": "value", "flag": true, "nested": [null, {"key": 1}]}),
+        ),
+    ] {
+        let mut spawn = test.client.spawn(&task, ());
+        if let Some(headers) = &expected {
+            spawn = spawn.headers(headers)?;
+        }
+        let spawned = spawn.send().await?;
+        let lease = test
+            .client
+            .claim_task("default", &Default::default())
+            .await?
+            .pop()
+            .expect("claim");
+        assert_eq!(lease.claimed_run().headers, expected);
+        router.dispatch(lease).await?;
+        assert_eq!(
+            spawned
+                .await_result(&test.client, Some(Duration::from_secs(1)))
+                .await?,
+            expected
+        );
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
