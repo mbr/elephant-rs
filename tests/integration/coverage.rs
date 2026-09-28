@@ -503,6 +503,54 @@ async fn exponential_retry_backoff() -> TestResult {
     .await
 }
 
+/// Verifies explicit retry reopens an exhausted task with another run.
+#[tokio::test]
+async fn manual_retry_extends_exhausted_task() -> TestResult {
+    let test = setup().await?;
+    let task = Task::<(), ()>::builder("manual-retry")?
+        .default_max_attempts(1)
+        .handler(|context, ()| async move {
+            if context.metadata().attempt == 1 {
+                Err(Error::handler(Box::new(TestFailure)))
+            } else {
+                Ok(())
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let original = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        task_row(&test.client, original.result.task_id).await?["state"],
+        "failed"
+    );
+    let retried = test
+        .client
+        .retry_task(
+            "default",
+            original.result.task_id.as_uuid(),
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(retried.task_id, original.result.task_id);
+    assert_ne!(retried.run_id, original.result.run_id);
+    assert_eq!(retried.attempt, 2);
+    assert!(!retried.created);
+    let pending = task_row(&test.client, retried.task_id).await?;
+    assert_eq!(pending["state"], "pending");
+    assert_eq!(pending["attempts"], 2);
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        task_row(&test.client, retried.task_id).await?["state"],
+        "completed"
+    );
+    assert_eq!(
+        run_row(&test.client, original.result.run_id).await?["state"],
+        "failed"
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
