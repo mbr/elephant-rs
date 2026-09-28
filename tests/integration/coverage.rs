@@ -1438,6 +1438,64 @@ async fn failed_step_is_reexecuted() -> TestResult {
     Ok(())
 }
 
+/// Verifies retry replays a completed prefix and executes only the unfinished suffix.
+#[tokio::test]
+async fn partial_workflow_executes_unfinished_suffix() -> TestResult {
+    let test = setup().await?;
+    let calls = Arc::new([
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ]);
+    let handler_calls = calls.clone();
+    let task = Task::<(), Vec<usize>>::builder("partial")?
+        .default_max_attempts(2)
+        .handler(move |context, ()| {
+            let calls = handler_calls.clone();
+            async move {
+                let mut values = Vec::new();
+                for index in 0..3 {
+                    if index == 2 && context.metadata().attempt == 1 {
+                        return Err(Error::handler(Box::new(TestFailure)));
+                    }
+                    values.push(
+                        context
+                            .step(format!("step-{index}"), || async {
+                                calls[index].fetch_add(1, Ordering::SeqCst);
+                                Ok(index + 1)
+                            })
+                            .await?,
+                    );
+                }
+                Ok(values)
+            }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        calls.each_ref().map(|count| count.load(Ordering::SeqCst)),
+        [1, 1, 0]
+    );
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        calls.each_ref().map(|count| count.load(Ordering::SeqCst)),
+        [1, 1, 1]
+    );
+    assert_eq!(
+        spawned
+            .await_result(&test.client, Some(Duration::from_secs(1)))
+            .await?,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        task_row(&test.client, spawned.result.task_id).await?["attempts"],
+        2
+    );
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
