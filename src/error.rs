@@ -159,10 +159,10 @@ pub enum Error {
         /// Identifies the task whose result was awaited.
         task_id: uuid::Uuid,
     },
-    /// Indicates that a spawn queue conflicts with its task definition.
+    /// Indicates that a spawn or dispatch queue conflicts with its task definition.
     #[error("task {task_name:?} uses queue {expected:?}, not {actual:?}")]
     TaskQueueMismatch {
-        /// Names the task being spawned.
+        /// Names the task whose queue conflicts with its definition.
         task_name: String,
         /// Names the queue configured on the task.
         expected: String,

@@ -96,6 +96,7 @@ where
         TaskRegistration {
             task: self.clone(),
             erased: Arc::new(ErasedTask {
+                queue_name: self.queue_name().cloned(),
                 handler: Arc::new(erased),
             }),
         }
@@ -317,6 +318,15 @@ impl Router {
         let activity = lease.activity();
         let wrapper = self.execution_wrapper.clone();
         let execute = async move {
+            if let Some(expected) = &task.queue_name
+                && expected != &run.queue_name
+            {
+                return Err(Error::TaskQueueMismatch {
+                    task_name: run.task_name.to_string(),
+                    expected: expected.to_string(),
+                    actual: run.queue_name.to_string(),
+                });
+            }
             let checkpoints = client
                 .get_checkpoints(
                     run.queue_name.as_str(),
@@ -361,6 +371,8 @@ impl Router {
 
 /// Stores a type-erased executable handler.
 struct ErasedTask {
+    /// Restricts dispatch to the queue bound by the task contract.
+    queue_name: Option<QueueName>,
     /// Invokes the typed handler through JSON boundaries.
     handler: Arc<dyn Fn(TaskContext, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>,
 }

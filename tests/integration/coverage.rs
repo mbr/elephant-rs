@@ -1323,6 +1323,59 @@ async fn unknown_deferral_preserves_database_error() -> TestResult {
     Ok(())
 }
 
+/// Verifies external producers cannot execute a queue-bound handler on another queue.
+#[tokio::test]
+async fn router_rejects_mismatched_claim_queue() -> TestResult {
+    let test = setup().await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let task = Task::<(), ()>::builder("queue-bound")?
+        .queue("other")?
+        .handler(move |_, ()| {
+            handler_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let producer = Task::<(), ()>::builder("queue-bound")?.build();
+    let wrong = test
+        .client
+        .spawn(&producer, ())
+        .max_attempts(1)
+        .send()
+        .await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let snapshot = test
+        .client
+        .fetch_task_result("default", wrong.result.task_id.as_uuid())
+        .await?
+        .expect("task");
+    assert_eq!(snapshot.state, TaskResultState::Failed);
+    let failure = snapshot.failure.expect("queue mismatch");
+    assert!(
+        failure["message"]
+            .as_str()
+            .expect("message")
+            .contains("uses queue \"other\", not \"default\"")
+    );
+    test.client
+        .create_queue("other", CreateQueueOptions::default())
+        .await?;
+    let right = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "other").await?;
+    assert_eq!(
+        test.client
+            .fetch_task_result("other", right.result.task_id.as_uuid())
+            .await?
+            .expect("task")
+            .state,
+        TaskResultState::Completed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
