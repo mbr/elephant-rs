@@ -1,10 +1,33 @@
 //! Behavioral coverage shared with the upstream SDK suites.
 
-use elephant::types::{
-    CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions, QueueStorageMode,
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
-use super::{TestResult, setup};
+use elephant::{
+    client::Client,
+    error::Error,
+    task::{Router, Task},
+    types::{
+        CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions, QueueStorageMode,
+        TaskId, TaskResultState,
+    },
+    worker::work_batch,
+};
+use serde_json::Value;
+
+use super::{TestFailure, TestResult, setup};
+
+/// Reads a task's persisted fields from the default queue.
+async fn task_row(client: &Client, task_id: TaskId) -> elephant::error::Result<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(t) FROM absurd.t_default t WHERE task_id = $1")
+            .bind(task_id.as_uuid())
+            .fetch_one(client.pool())
+            .await?,
+    )
+}
 
 /// Verifies partitioned queue options produce the expected relation kinds.
 #[tokio::test]
@@ -128,6 +151,48 @@ async fn permissive_queue_names() -> TestResult {
                 .iter()
                 .any(|queue| queue.as_str() == name)
         );
+    }
+    Ok(())
+}
+
+/// Verifies client defaults, task defaults, and spawn overrides select retry limits.
+#[tokio::test]
+async fn retry_limit_precedence() -> TestResult {
+    let test = setup().await?;
+    let mut builder = Client::builder(test.client.pool().clone());
+    builder.default_queue("default")?.default_max_attempts(2);
+    let client = builder.build();
+    for (index, limit) in [2, 3, 4].into_iter().enumerate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let mut builder = Task::<(), ()>::builder(format!("limit-{index}"))?;
+        if index > 0 {
+            builder = builder.default_max_attempts(3);
+        }
+        let task = builder.build().handler(move |_, ()| {
+            handler_calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(Error::handler(Box::new(TestFailure))) }
+        });
+        let router = Router::new().task(task.clone())?;
+        let mut spawn = client.spawn(&task, ());
+        if index == 2 {
+            spawn = spawn.max_attempts(4);
+        }
+        let spawned = spawn.send().await?;
+        assert_eq!(
+            task_row(&client, spawned.result.task_id).await?["max_attempts"],
+            limit
+        );
+        for _ in 0..limit {
+            work_batch(&client, &router, "default").await?;
+        }
+        let snapshot = client
+            .fetch_task_result("default", spawned.result.task_id.as_uuid())
+            .await?
+            .expect("task");
+        assert_eq!(snapshot.state, TaskResultState::Failed);
+        work_batch(&client, &router, "default").await?;
+        assert_eq!(calls.load(Ordering::SeqCst), limit as usize);
     }
     Ok(())
 }
