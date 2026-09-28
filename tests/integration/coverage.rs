@@ -2155,6 +2155,47 @@ async fn worker_executes_both_slots_concurrently() -> TestResult {
     .await
 }
 
+/// Verifies a slow handler does not prevent repeated use of the other worker slot.
+#[tokio::test]
+async fn worker_refills_slot_alongside_slow_handler() -> TestResult {
+    let test = setup().await?;
+    let release = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = observed_task(vec![release.clone()], sender)?;
+    let slow = test.client.spawn(&task, 0).send().await?;
+    let scenario = async {
+        let _stop = shutdown.clone().drop_guard();
+        let _release = release.clone().drop_guard();
+        assert_eq!(next_started(&mut receiver).await?, 0);
+        for index in 1..=2 {
+            let fast = test.client.spawn(&task, index).send().await?;
+            assert_eq!(next_started(&mut receiver).await?, index);
+            assert_eq!(
+                fast.await_result(&test.client, Some(Duration::from_secs(2)))
+                    .await?,
+                index
+            );
+            assert_eq!(
+                task_row(&test.client, slow.result.task_id).await?["state"],
+                "running"
+            );
+        }
+        Ok(())
+    };
+    worker_scenario(
+        &test,
+        Router::new().task(task.clone())?,
+        WorkerOptions {
+            concurrency: 2,
+            ..Default::default()
+        },
+        &shutdown,
+        scenario,
+    )
+    .await
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
