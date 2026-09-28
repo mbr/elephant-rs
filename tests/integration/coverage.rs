@@ -13,8 +13,8 @@ use elephant::{
     error::Error,
     task::{Router, Task},
     types::{
-        CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions, QueueStorageMode,
-        RetryStrategy, TaskId, TaskResultState,
+        CancellationPolicy, CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions,
+        QueueStorageMode, RetryStrategy, TaskId, TaskResultState,
     },
     worker::work_batch,
 };
@@ -614,6 +614,71 @@ async fn retry_as_new_discards_checkpoints() -> TestResult {
     );
     work_batch(&test.client, &router, "default").await?;
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+/// Verifies explicit and task-default cancellation policies cancel durable work.
+#[tokio::test]
+async fn durable_cancellation_policies() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    for case in 0..3 {
+        clock(&test.client, case * 100).await?;
+        let delay = CancellationPolicy {
+            max_delay: Some(Duration::from_secs(20)),
+            ..Default::default()
+        };
+        let policy = if case == 2 {
+            CancellationPolicy {
+                max_duration: Some(Duration::from_secs(30)),
+                ..Default::default()
+            }
+        } else {
+            delay.clone()
+        };
+        let mut builder =
+            Task::<(), ()>::builder(format!("cancel-policy-{case}"))?.default_max_attempts(2);
+        if case > 0 {
+            builder = builder.default_cancellation(delay);
+        }
+        let task = builder
+            .handler(|_, ()| async { Err(Error::handler(Box::new(TestFailure))) })
+            .build();
+        let router = Router::new().task(task.clone())?;
+        let mut spawn = test
+            .client
+            .spawn(&task, ())
+            .retry_strategy(RetryStrategy::Fixed {
+                base: Duration::from_secs(10),
+            });
+        if case != 1 {
+            spawn = spawn.cancellation(policy.clone());
+        }
+        let spawned = spawn.send().await?;
+        assert_eq!(
+            task_row(&test.client, spawned.result.task_id).await?["cancellation"],
+            policy.to_json()
+        );
+        if case == 2 {
+            work_batch(&test.client, &router, "default").await?;
+        }
+        clock(&test.client, case * 100 + 40).await?;
+        assert!(
+            test.client
+                .claim_task("default", &Default::default())
+                .await?
+                .is_empty()
+        );
+        let row = task_row(&test.client, spawned.result.task_id).await?;
+        assert_eq!(row["state"], "cancelled");
+        assert!(!row["cancelled_at"].is_null());
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM absurd.r_default WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+        )
+        .bind(spawned.result.task_id.as_uuid())
+        .fetch_one(test.client.pool())
+        .await?;
+        assert_eq!(state, "cancelled");
+    }
     Ok(())
 }
 
