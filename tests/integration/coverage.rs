@@ -720,6 +720,26 @@ async fn cancellation_terminal_database_state() -> TestResult {
     Ok(())
 }
 
+/// Verifies repeated cancellation preserves the original cancellation timestamp.
+#[tokio::test]
+async fn cancellation_is_idempotent() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("cancel-twice")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    test.client
+        .cancel_task("default", spawned.result.task_id.as_uuid())
+        .await?;
+    let first = task_row(&test.client, spawned.result.task_id).await?;
+    assert!(!first["cancelled_at"].is_null());
+    clock(&test.client, 60).await?;
+    test.client
+        .cancel_task("default", spawned.result.task_id.as_uuid())
+        .await?;
+    assert_eq!(task_row(&test.client, spawned.result.task_id).await?, first);
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
