@@ -365,12 +365,13 @@ struct ErasedTask {
     handler: Arc<dyn Fn(TaskContext, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>,
 }
 
-/// Returns a jitter duration up to the provided maximum.
+/// Returns positive jitter at database precision unless deferral is disabled.
 fn jitter_duration(maximum: Duration) -> Duration {
-    let millis = maximum.as_millis();
-    if millis == 0 {
+    if maximum.is_zero() {
         return Duration::ZERO;
     }
-    let upper = u64::try_from(millis).unwrap_or(u64::MAX);
-    Duration::from_millis(rand::rng().random_range(0..=upper))
+    let upper = u64::try_from(maximum.as_micros())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    Duration::from_micros(rand::rng().random_range(1..=upper))
 }

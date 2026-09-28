@@ -1259,6 +1259,43 @@ async fn database_error_preserves_sqlstate_and_source() -> TestResult {
     Ok(())
 }
 
+/// Verifies unknown-task deferral schedules positive delays without spending attempts.
+#[tokio::test]
+async fn unknown_deferral_preserves_attempt_and_failure_state() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("unknown")?.build();
+    for delay in [Duration::from_micros(500), Duration::from_secs(5)] {
+        let spawned = test.client.spawn(&task, ()).send().await?;
+        work_batch(
+            &test.client,
+            &Router::new().unknown_task_delay(delay),
+            "default",
+        )
+        .await?;
+        let task = task_row(&test.client, spawned.result.task_id).await?;
+        let run = run_row(&test.client, spawned.result.run_id).await?;
+        assert_eq!(task["state"], "sleeping");
+        assert_eq!(task["attempts"], 1);
+        assert_eq!(run["state"], "sleeping");
+        assert_eq!(run["attempt"], 1);
+        assert!(run["failure_reason"].is_null());
+        let remaining: f64 = sqlx::query_scalar("SELECT extract(epoch FROM available_at - absurd.current_time())::float8 FROM absurd.r_default WHERE run_id = $1")
+            .bind(spawned.result.run_id.as_uuid()).fetch_one(test.client.pool()).await?;
+        assert!(
+            remaining > 0.0 && remaining <= delay.as_secs_f64(),
+            "deferral: {remaining}"
+        );
+        assert!(
+            test.client
+                .claim_task("default", &Default::default())
+                .await?
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
