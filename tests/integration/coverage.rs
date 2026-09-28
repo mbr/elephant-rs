@@ -1151,6 +1151,58 @@ async fn expired_claim_is_retried_by_another_worker() -> TestResult {
     Ok(())
 }
 
+/// Verifies task/event cleanup honors retention and completed runs retain ownership history.
+#[tokio::test]
+async fn cleanup_respects_task_and_event_ttl() -> TestResult {
+    let test = super::setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    test.client
+        .set_queue_policy(
+            "default",
+            QueuePolicyOptions {
+                cleanup_ttl: Some("1 hour".parse()?),
+                cleanup_limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let task = Task::<(), ()>::builder("cleanup")?.build();
+    let spawned = test.client.spawn(&task, ()).send().await?;
+    let lease = test
+        .client
+        .claim_task(
+            "default",
+            &elephant::worker::ClaimOptions {
+                worker_id: "cleaner".into(),
+                claim_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await?
+        .pop()
+        .expect("claim");
+    let before = run_row(&test.client, spawned.result.run_id).await?;
+    clock(&test.client, 600).await?;
+    lease.complete(()).await?;
+    test.client
+        .emit_event("default", "cleanup-event", &true)
+        .await?;
+    let completed = run_row(&test.client, spawned.result.run_id).await?;
+    assert_eq!(completed["claimed_by"], "cleaner");
+    assert_eq!(completed["claim_expires_at"], before["claim_expires_at"]);
+    for (time, deleted, remaining) in [(2400, 0, 1_i64), (4201, 1, 0)] {
+        clock(&test.client, time).await?;
+        let result = test.client.cleanup_queue("default").await?;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].queue_name.as_str(), "default");
+        assert_eq!(result[0].tasks_deleted, deleted);
+        assert_eq!(result[0].events_deleted, deleted);
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM absurd.t_default), (SELECT count(*) FROM absurd.e_default)").fetch_one(test.client.pool()).await?;
+        assert_eq!(counts, (remaining, remaining));
+    }
+    Ok(())
+}
+
 /// Verifies listing and dropping queues also removes their physical tables.
 #[tokio::test]
 async fn queue_lifecycle() -> TestResult {
