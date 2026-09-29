@@ -196,19 +196,18 @@ signal; it does not hold a worker slot until wakeup.
 separate event identity from checkpoint identity. Events are immutable per queue
 and name: the first emit wins. Repeated waits for one name do not represent a
 stream of successive events. Missing timeout payloads and JSON null payloads
-remain distinguishable. Before delivering `Error::EventTimeout`, the context
-persists a timeout outcome for that numbered wait. Replay delivers the same error
-after later sleeps, retries, or late event emission. Failure to persist the outcome
-returns the write error instead of exposing an unrecorded timeout decision.
+remain distinguishable. On timeout resumption, the first uncached wait for that
+event raises `Error::EventTimeout`. If the handler catches it and waits for the
+same event again within that dispatch, the next wait acknowledges the database
+timeout marker with JSON null instead of suspending again. This acknowledgement
+is not an emitted event, a persisted checkpoint, or durable application progress.
 
-Event suspension atomically checkpoints its exact wait identity, preventing an
-older cached timeout from consuming a later occurrence's wake signal. Event calls
-are serialized across context clones while these transitions are in progress.
-If the handler catches a timeout and waits for the same event again in that
-dispatch, Absurd can acknowledge the timeout marker with JSON null. That result is
-checkpointed atomically with acknowledgement, so subsequent replay is stable.
-The acknowledgement is not an emitted event, but its checkpoint is application
-progress.
+The shared protocol does not retain a checkpointed timeout outcome. A later
+suspension or task retry can therefore re-enter the wait and accept a late event.
+Applications can mitigate this by wrapping the wait and timeout fallback in an
+ordinary step that returns a successful decision value. Once committed, that
+step replays without re-entering the wait. The observation and checkpoint write
+are not atomic, so this is not a complete fix for durable deadline enforcement.
 
 `await_task_result` and its named variant poll another queue while retaining a
 worker slot. They explicitly heartbeat to maintain the claim and report continued
@@ -226,7 +225,7 @@ its reference.
 ## Checkpoint identity and cross-language compatibility
 
 Checkpoint naming and built-in payloads follow the Go, Python, and TypeScript
-SDKs at Absurd `0.5.0` for successful results. Each base name has a per-dispatch occurrence counter,
+SDKs at Absurd `0.5.0`. Each base name has a per-dispatch occurrence counter,
 shared by context clones and all operation kinds. The first occurrence uses
 the base name; subsequent ones append `#2`, `#3`, and so on. Replay resets the
 counters rather than deriving them from stored checkpoints.
@@ -236,14 +235,6 @@ counters rather than deriving them from stored checkpoints.
 - Events use caller base names or `$awaitEvent:{event_name}`, storing raw payloads.
 - Child waits use caller base names or `$awaitTaskResult:{task_id}`, storing a
   terminal snapshot with optional result/failure payloads, including JSON null.
-
-Elephant additionally reserves `$elephant:` for internal checkpoints. Event waits
-store their pending numbered name in `$elephant:awaitEventPending`, and observed
-timeouts store `true` in `$elephant:awaitEventTimeout:{numbered_name}`. These keys
-are separate from raw event payloads, so JSON null and arbitrary event objects
-cannot be mistaken for timeouts. Context APIs reject caller names in that namespace.
-Upstream SDKs do not interpret these auxiliary timeout records. To replay a timeout
-decision across SDKs, checkpoint the complete business decision in an ordinary step.
 
 Logical IDs such as `charge:{order_id}` are preferable for unordered or parallel
 work, where occurrence order can otherwise change on replay. Generated suffixes
