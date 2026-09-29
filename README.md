@@ -223,7 +223,9 @@ not the owning-run control signal `Error::Cancelled`.
 Child-result waits poll while occupying a worker slot; they do not durably
 suspend the run. Cross-queue dependency cycles can still deadlock. The raw
 `Client` result APIs are non-durable and intentionally do not enforce contextual
-same-queue restrictions.
+same-queue restrictions. Result polling timeouts cover pool acquisition, database
+queries, and polling delays; a zero timeout expires immediately. Contextual waits
+can still replay an already-checkpointed child result without polling.
 
 ## Checkpoint compatibility
 

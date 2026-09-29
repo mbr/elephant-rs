@@ -2,6 +2,8 @@
 
 #[path = "integration/coverage.rs"]
 mod coverage;
+#[path = "integration/regressions.rs"]
+mod regressions;
 
 use std::{
     collections::BTreeMap,

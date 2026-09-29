@@ -588,6 +588,9 @@ impl Client {
     }
 
     /// Waits for a terminal task result.
+    ///
+    /// The timeout covers pool acquisition, database queries, and polling delays.
+    /// A zero duration expires immediately without querying the database.
     pub async fn await_task_result(
         &self,
         queue_name: impl AsRef<str>,
@@ -595,28 +598,26 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<TaskResultSnapshot> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
-        let started = std::time::Instant::now();
-        let mut delay = Duration::from_millis(50);
-        loop {
-            let snapshot = self
-                .fetch_task_result(queue_name.as_str(), task_id)
-                .await?
-                .ok_or(Error::TaskNotFound { task_id })?;
-            if snapshot.is_terminal() {
-                return Ok(snapshot);
-            }
-            let sleep_for = match timeout {
-                Some(timeout) => {
-                    let remaining = timeout.saturating_sub(started.elapsed());
-                    if remaining.is_zero() {
-                        return Err(Error::TaskResultTimeout { task_id });
-                    }
-                    delay.min(remaining)
+        let wait = async {
+            let mut delay = Duration::from_millis(50);
+            loop {
+                let snapshot = self
+                    .fetch_task_result(queue_name.as_str(), task_id)
+                    .await?
+                    .ok_or(Error::TaskNotFound { task_id })?;
+                if snapshot.is_terminal() {
+                    return Ok(snapshot);
                 }
-                None => delay,
-            };
-            sleep(sleep_for).await;
-            delay = (delay * 2).min(Duration::from_secs(1));
+                sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(1));
+            }
+        };
+        match timeout {
+            Some(duration) if duration.is_zero() => Err(Error::TaskResultTimeout { task_id }),
+            Some(duration) => tokio::time::timeout(duration, wait)
+                .await
+                .map_err(|_| Error::TaskResultTimeout { task_id })?,
+            None => wait.await,
         }
     }
 
