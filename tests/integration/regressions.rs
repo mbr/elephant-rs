@@ -108,6 +108,32 @@ async fn wrapped_application_failures_are_not_control_signals() -> TestResult {
     Ok(())
 }
 
+/// Persists a nested application's leaf diagnostic exactly once.
+#[tokio::test]
+async fn nested_handler_failure_is_not_duplicated() -> TestResult {
+    let test = setup_with_max_connections(1).await?;
+    let task = Task::<(), ()>::builder("nested-failure")?
+        .default_max_attempts(1)
+        .handler(|_, ()| async { Err(application_error(Error::handler(Box::new(TestFailure)))) })
+        .build();
+    let router = Router::new().task(task.clone())?;
+    let handle = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    let snapshot = test
+        .client
+        .fetch_task_result("default", handle.result.task_id.as_uuid())
+        .await?
+        .expect("failed task");
+    assert_eq!(snapshot.state, TaskResultState::Failed);
+    let failure = snapshot.failure.expect("failure reason");
+    assert_eq!(failure["name"], "handler_error");
+    assert_eq!(
+        failure["message"],
+        "application helper failed: handler failed: intentional test failure"
+    );
+    Ok(())
+}
+
 /// Advances the clock on a fixture restricted to one database connection.
 async fn clock(client: &Client, seconds: i32) -> elephant::error::Result<()> {
     sqlx::query("SELECT set_config('absurd.fake_now', (TIMESTAMPTZ '2025-01-01' + make_interval(secs => $1))::text, false)")

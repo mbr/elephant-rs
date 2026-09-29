@@ -51,7 +51,7 @@ pub enum Error {
     #[error("lease renewal exceeded the current claim deadline")]
     LeaseRenewalTimeout,
     /// Indicates that a task handler returned an error.
-    #[error("handler failed: {source}")]
+    #[error("handler failed")]
     Handler {
         /// Carries the task handler error.
         #[source]
@@ -339,7 +339,33 @@ impl fmt::Display for FailureReason {
 mod tests {
     //! Separates owning-run control flow from failures in nested error chains.
 
-    use super::Error;
+    use std::error::Error as StdError;
+
+    use super::{Error, FailureReason};
+
+    /// Formats each SDK error once without discarding typed sources.
+    #[test]
+    fn nested_handler_diagnostics_preserve_sources_without_repetition() {
+        let error = Error::handler(Box::new(Error::handler(Box::new(Error::EventTimeout))));
+        let reason = FailureReason::from_error_named("handler_error", &error);
+        assert_eq!(error.to_string(), "handler failed");
+        assert_eq!(reason.name, "handler_error");
+        assert_eq!(
+            reason.message,
+            "handler failed: handler failed: event wait timed out"
+        );
+        let inner = error.source().expect("inner handler");
+        assert!(matches!(
+            inner.downcast_ref::<Error>(),
+            Some(Error::Handler { .. })
+        ));
+        assert!(matches!(
+            inner
+                .source()
+                .and_then(|source| source.downcast_ref::<Error>()),
+            Some(Error::EventTimeout)
+        ));
+    }
 
     /// Recognizes only the control variants, even through nested handler errors.
     #[test]
