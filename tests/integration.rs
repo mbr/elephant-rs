@@ -180,7 +180,7 @@ async fn headers_reach_typed_handlers() -> TestResult {
                     .expect("headers should reach wrapper")["traceparent"],
                 "parent-span"
             );
-            async move { execute.await }
+            execute
         });
     let spawned = test
         .client

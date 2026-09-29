@@ -133,6 +133,11 @@ that distinguish worker instances across hosts and restarts.
 
 ## Database budgets and process supervision
 
+The [runnable operations example](https://github.com/mbr/elephant-rs/tree/main/examples/operations)
+combines pool budgets, transactional submission, explicit progress, idempotent
+effects, signal handling, and external restart policy. Its disposable-database
+smoke test exercises real `SIGTERM` drain; `./check.sh` and `nix build` run it.
+
 Claim duration, execution deadlines, and cancellation grace do not bound a claim
 query blocked inside PostgreSQL. Shutdown deliberately waits for issued claims,
 including leases returned after shutdown was requested. Do not wrap the entire

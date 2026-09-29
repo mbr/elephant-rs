@@ -52,6 +52,7 @@
             # Avoid runtime references from embedded toolchain source paths.
             + "--remap-path-prefix=${buildToolchain}=/rustc";
           OPENSSL_NO_VENDOR = "1";
+          SQLX_OFFLINE = "true";
         };
       in
       {
@@ -62,7 +63,15 @@
             version = cargoToml.package.version;
             description = cargoToml.package.description;
             nativeBuildInputs = with pkgs; [ llvmPackages.bintools ];
-            nativeCheckInputs = with pkgs; [ postgresql ];
+            nativeCheckInputs = [
+              pkgs.postgresql
+              pkgs.coreutils
+              pgdb.packages.${system}.default
+            ];
+            postCheck = ''
+              cargo build --release --offline --locked --example operations --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+              ./examples/operations/smoke.sh target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/examples/operations
+            '';
 
             src = pkgs.lib.cleanSource ./.;
 
@@ -83,6 +92,8 @@
               pgdb.packages.${system}.default
               pkgs.nixfmt
               pkgs.postgresql
+              pkgs.sqlx-cli
+              pkgs.coreutils
             ];
             RUST_LOG = "debug";
           }

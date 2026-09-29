@@ -25,4 +25,14 @@ tracing = "0.1.41"
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
 
 [dev-dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
 pgdb = "0.9.0"
+sec = "1.1"
+sqlx = { version = "=0.8.6", features = ["macros", "migrate"] }
+tokio = { version = "1.48.0", features = ["signal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "operations"
+path = "examples/operations/main.rs"
+test = true
