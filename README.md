@@ -127,6 +127,65 @@ bounded by free execution slots. Shutdown stops new claims and drains both
 issued claim queries and active executions; it does not cancel handlers.
 Infrastructure errors likewise stop claiming, drain active work, and return to
 the application supervisor. Handler failures are recorded for database retry.
+Use `.worker_id(instance_id)` to identify a process in persisted claims and
+lease-expiry diagnostics; the default is `elephant-worker`. Choose identities
+that distinguish worker instances across hosts and restarts.
+
+## Database budgets and process supervision
+
+Claim duration, execution deadlines, and cancellation grace do not bound a claim
+query blocked inside PostgreSQL. Shutdown deliberately waits for issued claims,
+including leases returned after shutdown was requested. Do not wrap the entire
+worker in a timeout that drops its future: a claim could already have committed.
+
+The application owns its SQLx pool and server-side execution limits. For example:
+
+```rust,no_run
+use elephant::{client::Client, task::Router};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+# async fn example(database_url: &str, instance_id: &str, router: Router, shutdown: CancellationToken) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let options = database_url.parse::<PgConnectOptions>()?
+    .application_name(instance_id)
+    .options([("statement_timeout", "5000"), ("lock_timeout", "2000")]);
+let pool = PgPoolOptions::new()
+    .max_connections(16)
+    .acquire_timeout(Duration::from_secs(2))
+    .connect_with(options)
+    .await?;
+let client = Client::builder(pool).build();
+client.worker(router).worker_id(instance_id).run(shutdown).await?;
+# Ok(())
+# }
+```
+
+These are illustrative budgets, not SDK defaults. They apply to all queries on
+this pool, including application SQL. Choose limits that accommodate legitimate
+work and enough connections for claims, handlers, and renewal. Pool acquisition
+timeouts do not bound SQL execution. PostgreSQL statement/lock timeouts cancel
+and roll back a blocked claim statement; its error reaches the worker supervisor.
+They do not bound every network failure, including a lost response after commit.
+
+Translate termination signals into the worker's `CancellationToken`, await its
+result, and let an external process supervisor enforce a final hard-stop budget.
+For example, an application-managed systemd service can use:
+
+```ini
+[Service]
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+SendSIGKILL=yes
+KillMode=control-group
+Restart=on-failure
+RestartSec=2s
+```
+
+The application must handle `SIGTERM` for graceful drain. After a hard stop,
+unresolved leases recover through PostgreSQL; external effects still need
+idempotency. These service settings illustrate supervision policy, not a complete
+unit file or an in-process preemption guarantee.
 
 ## Execution supervision
 

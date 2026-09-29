@@ -159,6 +159,12 @@ impl WorkerBuilder {
         self
     }
 
+    /// Sets the identity recorded on claims and lease-expiry diagnostics.
+    pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
+        self.options.claim.worker_id = worker_id.into();
+        self
+    }
+
     /// Sets dispatch concurrency.
     pub fn concurrency(mut self, concurrency: usize) -> Self {
         self.options.concurrency = concurrency;
@@ -207,7 +213,11 @@ impl WorkerBuilder {
         self
     }
 
-    /// Runs the worker until cancellation.
+    /// Runs the worker and drains issued claims and active work on cancellation.
+    ///
+    /// A blocked claim query can delay shutdown indefinitely. Configure database
+    /// statement timeouts and an external process supervisor for a hard bound;
+    /// do not discard this future while a claim's outcome may be uncertain.
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         run_worker(self.client, self.router, self.options, shutdown).await
     }

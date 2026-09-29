@@ -108,13 +108,23 @@ Each claim batch is capped by currently available execution slots. A claim query
 is retained until it returns, even after shutdown or another execution's error;
 its returned leases are dispatched and drained. Dropping an in-flight claim
 query could abandon database-committed claims whose rows were not yet received.
-Zero concurrency and nonpositive batch sizes are rejected.
+Zero concurrency and nonpositive batch sizes are rejected. `WorkerBuilder::worker_id`
+sets the identity used in claim rows and lease-expiry diagnostics; it is forwarded
+without rewriting. The default remains `elephant-worker`.
 
 Shutdown stops new claim requests and drains issued claims and active work. It
 does not cancel handlers. The first infrastructure error also stops claiming;
 after draining, the worker returns that error to the application supervisor.
 Ordinary handler failures are persisted and retried according to database
 policy, not returned as worker infrastructure failures.
+
+There is no implicit query deadline or unconditional shutdown bound for an issued
+claim. A blocked claim can hold drain indefinitely even with no active handlers.
+The caller owns SQLx acquisition limits, PostgreSQL statement/lock timeouts, and
+external process supervision. A server-cancelled claim statement rolls back and
+surfaces as an infrastructure error; a local timeout dropping the claim future
+cannot provide that certainty. Server execution limits do not cover every network
+failure. A hard process stop leaves unresolved leases for database recovery.
 
 Unknown task names are deferred with jitter rather than failed immediately,
 allowing rolling deployments with different registered task sets.

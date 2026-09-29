@@ -2,6 +2,8 @@
 
 #[path = "integration/coverage.rs"]
 mod coverage;
+#[path = "integration/operations.rs"]
+mod operations;
 #[path = "integration/regressions.rs"]
 mod regressions;
 
