@@ -219,8 +219,15 @@ ordinary step that returns a successful decision value. Once committed, that
 step replays without re-entering the wait. The observation and checkpoint write
 are not atomic, so this is not a complete fix for durable deadline enforcement.
 
-`await_task_result` and its named variant poll another queue while retaining a
-worker slot. They explicitly heartbeat to maintain the claim and report continued
+`await_task_result` and its named variant accept a typed spawn handle.
+`await_task_result_by_id` and `await_task_result_by_id_named` instead accept only
+a queue name and task UUID, without requiring run or producer metadata. The
+handle methods delegate to the identity methods; all use the same default names,
+occurrence counters, and terminal snapshots. Queue validation and same-queue
+rejection happen before checkpoint lookup or occurrence allocation.
+
+These waits poll another queue while retaining a worker slot. They explicitly
+heartbeat to maintain the claim and report continued
 application activity, even when a background supervisor is also renewing it.
 A terminal raw snapshot is checkpointed before decoding, including failed and
 cancelled child states. Replay survives child retention cleanup. JSON null
@@ -230,7 +237,10 @@ Same-queue context waits are rejected to reduce worker-slot deadlocks. Cross-que
 cycles can still deadlock. Raw client result polling is intentionally
 non-durable and does not enforce context restrictions. Child creation should use
 stable idempotency keys: a crash can occur between spawning and checkpointing
-its reference.
+its reference. Applications sharing workflows across SDKs should agree on the
+reference payload schema: native spawn-result JSON field names and wrappers
+differ between SDKs. The identity APIs do not define or persist a new reference
+format, change existing `Spawned` serialization, or add private checkpoints.
 
 ## Checkpoint identity and cross-language compatibility
 

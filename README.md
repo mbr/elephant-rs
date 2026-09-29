@@ -281,9 +281,10 @@ outcome. This mitigation protects a committed decision, not the crash window
 between observing the timeout and checkpointing that decision.
 
 Waiting for a task result from the same queue inside a task is rejected because it
-can deadlock a worker pool. Cross-queue waits are available through
-`TaskContext::await_task_result` and `await_task_result_named`. They checkpoint the
-terminal snapshot before decoding, so replay survives child cleanup, including
+can deadlock a worker pool. Cross-queue waits accept a typed `Spawned` handle through
+`TaskContext::await_task_result` and `await_task_result_named`, or just queue/task
+identity through `await_task_result_by_id` and `await_task_result_by_id_named`.
+All variants checkpoint the same terminal snapshot before decoding, so replay survives child cleanup, including
 failed or cancelled child results. A cancelled child produces `Error::TaskCancelled`,
 not the owning-run control signal `Error::Cancelled`.
 
@@ -319,6 +320,40 @@ Go-generated PostgreSQL fixtures test both replay and Rust-written formats,
 including repeated names, sleeps, events, and child snapshots. Cross-language
 workflows must still agree on names, call order, and application JSON schemas.
 For Rust's unnamed sleep helpers, use `sleep` as the name in other SDKs.
+
+Native spawn-result serialization is not a shared cross-SDK contract: Go uses
+fields such as `TaskID`, Python uses `task_id`, and TypeScript uses `taskID`.
+Elephant's `Spawned` also includes a queue wrapper. For portable application
+checkpoints, agree on a small reference schema rather than serializing each SDK's
+native return object. For example:
+
+```rust,no_run
+use elephant::context::TaskContext;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Identifies a child without storing run or producer metadata.
+#[derive(Deserialize, Serialize)]
+struct ChildReference {
+    /// Names the child queue.
+    queue: String,
+    /// Identifies the durable child task.
+    task_id: Uuid,
+}
+
+# async fn example(context: &TaskContext, reference: ChildReference) -> elephant::error::Result<serde_json::Value> {
+context.await_task_result_by_id_named(
+    "enrichment", &reference.queue, reference.task_id, None,
+).await
+# }
+```
+
+This is an application-defined payload, not a new Absurd protocol type. Persist
+it in an ordinary step with an idempotent child spawn. The identity-only APIs
+require no run ID, attempt, or creation flag. Their unnamed checkpoint remains
+`$awaitTaskResult:{task_id}`; named calls and occurrence numbering are unchanged.
+Handle-based and identity-only waits can replay each other's checkpoints. Queue
+validation and same-queue rejection still apply before cached observations.
 
 ## Execution instrumentation
 

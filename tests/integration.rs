@@ -4,6 +4,8 @@
 mod coverage;
 #[path = "integration/operations.rs"]
 mod operations;
+#[path = "integration/references.rs"]
+mod references;
 #[path = "integration/regressions.rs"]
 mod regressions;
 
@@ -27,7 +29,7 @@ use elephant::{
     task::{Router, Task},
     types::{
         CreateQueueOptions, PgInterval, QueueDetachMode, QueuePolicyOptions, RetryStrategy,
-        SpawnOptions, SpawnResult, Spawned, TaskResultSnapshot, TaskResultState,
+        SpawnOptions, TaskResultSnapshot, TaskResultState,
     },
     worker::{WorkerOptions, work_batch},
 };
@@ -373,15 +375,6 @@ async fn checkpoints_interoperate_with_go() -> TestResult {
                     for _ in 0..2 {
                         assert_eq!(context.await_event::<i32>("ready").await?, 99);
                     }
-                    let child = Spawned::<serde_json::Value>::new(
-                        "children".parse()?,
-                        SpawnResult {
-                            task_id: context.metadata().task_id,
-                            run_id: context.metadata().run_id,
-                            attempt: 1,
-                            created: false,
-                        },
-                    );
                     for name in [
                         "child-completed",
                         "child-null",
@@ -390,7 +383,12 @@ async fn checkpoints_interoperate_with_go() -> TestResult {
                     ] {
                         if replay {
                             let result = context
-                                .await_task_result_named(name, &child, Some(Duration::ZERO))
+                                .await_task_result_by_id_named::<serde_json::Value>(
+                                    name,
+                                    "children",
+                                    context.metadata().task_id.as_uuid(),
+                                    Some(Duration::ZERO),
+                                )
                                 .await;
                             match name {
                                 "child-completed" => {
@@ -886,7 +884,12 @@ async fn child_wait_renews_manual_claim() -> TestResult {
             let child = child.clone();
             async move {
                 context
-                    .await_task_result_named("child-result", &child, Some(Duration::from_secs(5)))
+                    .await_task_result_by_id_named::<Output>(
+                        "child-result",
+                        child.queue_name.as_str(),
+                        child.result.task_id.as_uuid(),
+                        Some(Duration::from_secs(5)),
+                    )
                     .await
             }
         })

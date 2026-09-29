@@ -318,9 +318,9 @@ impl TaskContext {
     where
         R: DeserializeOwned,
     {
-        self.await_task_result_named(
-            format!("$awaitTaskResult:{}", spawned.result.task_id),
-            spawned,
+        self.await_task_result_by_id(
+            spawned.queue_name.as_str(),
+            spawned.result.task_id.as_uuid(),
             timeout,
         )
         .await
@@ -336,16 +336,64 @@ impl TaskContext {
     where
         R: DeserializeOwned,
     {
-        if spawned.queue_name == self.metadata.queue_name {
+        self.await_task_result_by_id_named(
+            step_name,
+            spawned.queue_name.as_str(),
+            spawned.result.task_id.as_uuid(),
+            timeout,
+        )
+        .await
+    }
+
+    /// Durably observes another queue's task using only its queue and task ID.
+    ///
+    /// Uses the same checkpoint name and terminal snapshot as
+    /// [`Self::await_task_result`], without requiring spawn or run metadata.
+    /// Polling occupies a worker slot and reports progress through heartbeats.
+    /// Same-queue waits are rejected, including when replaying a cached result.
+    pub async fn await_task_result_by_id<R>(
+        &self,
+        queue_name: impl AsRef<str>,
+        task_id: uuid::Uuid,
+        timeout: Option<Duration>,
+    ) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
+        self.await_task_result_by_id_named(
+            format!("$awaitTaskResult:{task_id}"),
+            queue_name,
+            task_id,
+            timeout,
+        )
+        .await
+    }
+
+    /// Durably observes a task by identity under an explicit checkpoint name.
+    ///
+    /// Shares naming and snapshot semantics with [`Self::await_task_result_named`].
+    /// The queue is validated and same-queue waits are rejected before replay.
+    /// A terminal snapshot is checkpointed before decoding, including failures,
+    /// cancellation, and JSON null; cached results survive child cleanup.
+    pub async fn await_task_result_by_id_named<R>(
+        &self,
+        step_name: impl AsRef<str>,
+        queue_name: impl AsRef<str>,
+        task_id: uuid::Uuid,
+        timeout: Option<Duration>,
+    ) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
+        let queue_name = queue_name.as_ref().parse::<QueueName>()?;
+        if queue_name == self.metadata.queue_name {
             return Err(Error::SameQueueWait);
         }
         let snapshot: TaskResultSnapshot = self
             .step(step_name, || async {
-                let wait = self.client.await_task_result(
-                    spawned.queue_name.as_str(),
-                    spawned.result.task_id.as_uuid(),
-                    timeout,
-                );
+                let wait = self
+                    .client
+                    .await_task_result(queue_name.as_str(), task_id, timeout);
                 tokio::pin!(wait);
                 let interval = (self.claim_timeout / 3).max(Duration::from_millis(1));
                 let mut heartbeat = interval_at(Instant::now() + interval, interval);
@@ -357,7 +405,7 @@ impl TaskContext {
                 }
             })
             .await?;
-        snapshot.decode_completed(spawned.result.task_id)
+        snapshot.decode_completed(task_id.into())
     }
 
     /// Creates or reads a durable sleep checkpoint.
