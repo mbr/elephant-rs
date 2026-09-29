@@ -272,8 +272,12 @@ Handlers and execution wrappers can inspect `context.metadata().headers`.
 `Router::wrap_execution` establishes application context around every handler,
 including when using the convenience worker. For distributed tracing, extract
 your tracing carrier from headers in this wrapper and instrument the returned
-execution future with your application's span. Preserve errors unchanged:
-suspension and owning-run cancellation are runtime control flow, not failures.
+execution future with your application's span. Suspension and owning-run
+cancellation are runtime control flow, not failures. Dispatch recognizes these
+signals through `std::error::Error::source` chains, so domain errors may wrap them
+without changing their meaning. Preserve the original error as a source rather
+than replacing it with a formatted string. Child cancellation, event timeouts,
+and local execution interruptions remain ordinary failures when wrapped.
 Use `SpawnBuilder::headers` from your application's enqueue wrapper to inject
 carriers; this also works with `send_on` and caller-owned transactions.
 

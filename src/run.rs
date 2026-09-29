@@ -309,6 +309,9 @@ impl RunLease {
     }
 
     /// Runs work and resolves the lease from its outcome.
+    ///
+    /// Owning-run control signals are recognized through error source chains.
+    /// Wrapped child failures and local execution interruptions remain failures.
     pub async fn run<T, Fut>(self, future: Fut) -> Result<()>
     where
         T: Serialize,
@@ -316,7 +319,7 @@ impl RunLease {
     {
         let outcome = match future.await {
             Ok(result) => self.complete(result).await,
-            Err(Error::Suspended | Error::Cancelled | Error::RunAlreadyFailed) => {
+            Err(error) if error.is_run_control_flow() => {
                 self.forget();
                 return Ok(());
             }

@@ -19,6 +19,101 @@ use serde_json::Value;
 
 use super::{TestFailure, TestResult, setup_with_max_connections};
 
+/// Carries an SDK error through an application's own error type.
+#[derive(Debug, thiserror::Error)]
+#[error("application helper failed")]
+struct ApplicationError {
+    /// Preserves the SDK error as the underlying cause.
+    #[source]
+    source: Error,
+}
+
+/// Adds a domain-error boundary without discarding the source chain.
+fn application_error(source: Error) -> Error {
+    Error::handler(Box::new(ApplicationError { source }))
+}
+
+/// Preserves suspension through both a domain helper and an execution wrapper.
+#[tokio::test]
+async fn wrapped_suspension_preserves_workflow_control_flow() -> TestResult {
+    let test = setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let task = Task::<(), ()>::builder("wrapped-sleep")?
+        .default_max_attempts(1)
+        .handler(|context, ()| async move {
+            assert_eq!(context.metadata().attempt, 1);
+            context
+                .sleep_for(Duration::from_secs(1))
+                .await
+                .map_err(application_error)
+        })
+        .build();
+    let router = Router::new()
+        .task(task.clone())?
+        .wrap_execution(|_, execute| async { execute.await.map_err(application_error) });
+    let handle = test.client.spawn(&task, ()).send().await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        test.client
+            .fetch_task_result("default", handle.result.task_id.as_uuid())
+            .await?
+            .expect("task")
+            .state,
+        TaskResultState::Sleeping
+    );
+    clock(&test.client, 1).await?;
+    work_batch(&test.client, &router, "default").await?;
+    handle
+        .await_result(&test.client, Some(Duration::from_secs(1)))
+        .await?;
+    Ok(())
+}
+
+/// Keeps wrapped child cancellation and event timeout as ordinary parent failures.
+#[tokio::test]
+async fn wrapped_application_failures_are_not_control_signals() -> TestResult {
+    let test = setup_with_max_connections(1).await?;
+    for event_timeout in [false, true] {
+        let task = Task::<(), ()>::builder("wrapped-failure")?
+            .default_max_attempts(1)
+            .handler(move |context, ()| async move {
+                let error = if event_timeout {
+                    Error::EventTimeout
+                } else {
+                    Error::TaskCancelled {
+                        task_id: context.metadata().task_id,
+                    }
+                };
+                Err(application_error(error))
+            })
+            .build();
+        let router = Router::new()
+            .task(task.clone())?
+            .wrap_execution(|_, execute| async { execute.await.map_err(application_error) });
+        let handle = test.client.spawn(&task, ()).send().await?;
+        work_batch(&test.client, &router, "default").await?;
+        let snapshot = test
+            .client
+            .fetch_task_result("default", handle.result.task_id.as_uuid())
+            .await?
+            .expect("task");
+        assert_eq!(snapshot.state, TaskResultState::Failed);
+        let failure = snapshot.failure.expect("failure");
+        assert_eq!(failure["name"], "handler_error");
+        assert!(
+            failure["message"]
+                .as_str()
+                .expect("message")
+                .contains(if event_timeout {
+                    "event wait timed out"
+                } else {
+                    "was cancelled"
+                })
+        );
+    }
+    Ok(())
+}
+
 /// Advances the clock on a fixture restricted to one database connection.
 async fn clock(client: &Client, seconds: i32) -> elephant::error::Result<()> {
     sqlx::query("SELECT set_config('absurd.fake_now', (TIMESTAMPTZ '2025-01-01' + make_interval(secs => $1))::text, false)")

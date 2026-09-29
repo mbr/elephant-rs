@@ -183,6 +183,21 @@ impl Error {
         Self::Handler { source }
     }
 
+    /// Recognizes owning-run control signals retained in an error's source chain.
+    pub(crate) fn is_run_control_flow(&self) -> bool {
+        let mut current: Option<&(dyn error::Error + 'static)> = Some(self);
+        while let Some(error) = current {
+            if matches!(
+                error.downcast_ref::<Self>(),
+                Some(Self::Suspended | Self::Cancelled | Self::RunAlreadyFailed)
+            ) {
+                return true;
+            }
+            current = error.source();
+        }
+        false
+    }
+
     /// Retains diagnostics from a caught handler or execution-wrapper panic.
     pub(crate) fn handler_panicked(payload: Box<dyn Any + Send>) -> Self {
         let message = if let Some(message) = payload.downcast_ref::<String>() {
@@ -317,5 +332,43 @@ impl fmt::Display for FailureReason {
     /// Formats the failure message.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}: {}", self.name, self.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Separates owning-run control flow from failures in nested error chains.
+
+    use super::Error;
+
+    /// Recognizes only the control variants, even through nested handler errors.
+    #[test]
+    fn wrapped_control_signals_are_distinct_from_failures() {
+        let cases = [
+            (Error::Suspended, true),
+            (Error::Cancelled, true),
+            (Error::RunAlreadyFailed, true),
+            (Error::EventTimeout, false),
+            (Error::ExecutionCancelled, false),
+            (Error::ExecutionTimedOut, false),
+            (Error::ExecutionStalled, false),
+            (
+                Error::TaskCancelled {
+                    task_id: uuid::Uuid::nil().into(),
+                },
+                false,
+            ),
+            (
+                Error::Sqlx {
+                    source: sqlx::Error::PoolClosed,
+                },
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.is_run_control_flow(), expected);
+            let wrapped = Error::handler(Box::new(Error::handler(Box::new(error))));
+            assert_eq!(wrapped.is_run_control_flow(), expected);
+        }
     }
 }

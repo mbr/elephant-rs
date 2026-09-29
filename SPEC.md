@@ -275,8 +275,12 @@ a post-unwind backtrace would not reproduce the panic's origin stack.
 Dispatch spans carry queue, task ID, run ID, attempt, and task name. Payloads and
 headers are never logged automatically. `Router::wrap_execution` establishes
 application context, including trace propagation from metadata headers, for
-both manual and convenience execution. Wrappers must preserve control-flow
-errors. Applications inject propagation headers through their enqueue wrapper
+both manual and convenience execution. Dispatch recognizes `Suspended`,
+`Cancelled`, and `RunAlreadyFailed` anywhere in `std::error::Error::source` chains.
+Wrappers may add domain errors provided they retain the original SDK error as a
+source; formatting it into an opaque string discards its control-flow identity.
+`TaskCancelled`, `EventTimeout`, and local execution interruptions are not owning-run
+control signals. Applications inject propagation headers through their enqueue wrapper
 using `SpawnBuilder::headers`; a separate spawn middleware framework is not
 required.
 
