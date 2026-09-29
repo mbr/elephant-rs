@@ -212,6 +212,9 @@ numbered automatically, including within loops.
 `TaskContext::await_event` derives its base checkpoint name from the event name;
 `await_event_named` selects one explicitly. Repeated waits get separate
 checkpoints, but an event name remains immutable: this is not an event stream.
+Observed event timeouts are checkpointed before `Error::EventTimeout` is returned;
+later sleeps, retries, and late event emission cannot reverse that outcome on replay.
+A subsequent null acknowledgement is also checkpointed before delivery.
 
 Waiting for a task result from the same queue inside a task is rejected because it
 can deadlock a worker pool. Cross-queue waits are available through
@@ -229,7 +232,8 @@ can still replay an already-checkpointed child result without polling.
 
 ## Checkpoint compatibility
 
-Elephant follows the Go, Python, and TypeScript SDKs in Absurd `0.5.0`: repeated
+For successful checkpoints, Elephant follows the Go, Python, and TypeScript SDKs
+in Absurd `0.5.0`: repeated
 names allocate `charge`, `charge#2`, `charge#3`, and so on. Counters start over on
 each dispatch and are shared by context clones and all operation kinds,
 including decomposed steps. Replaying the same call sequence reuses the same
@@ -247,6 +251,12 @@ names when payload shape or meaning changes.
 | Sleep | Caller name, or `sleep`; RFC 3339 timestamp string |
 | Event | Caller name, or `$awaitEvent:{event_name}`; raw event payload |
 | Child result | Caller name, or `$awaitTaskResult:{task_id}`; terminal snapshot |
+
+The `$elephant:` checkpoint namespace is reserved for SDK metadata. Elephant uses
+separate records for pending event wait identity and observed timeouts, leaving
+successful event payloads unchanged. Other SDKs do not interpret these timeout
+records; checkpoint the complete approval-or-timeout decision in an ordinary step
+when its replay must work across SDKs.
 
 Go-generated PostgreSQL fixtures test both replay and Rust-written formats,
 including repeated names, sleeps, events, and child snapshots. Cross-language

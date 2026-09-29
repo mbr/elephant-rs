@@ -11,11 +11,14 @@ use std::{
 use jiff::Timestamp;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::time::{Instant, interval_at};
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    time::{Instant, interval_at},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    client::Client,
+    client::{Client, EVENT_WAIT_CHECKPOINT},
     error::{Error, Result},
     run::{ClaimedRun, ExecutionActivity},
     types::{EventName, QueueName, RunId, Spawned, StepName, TaskId, TaskName, TaskResultSnapshot},
@@ -55,8 +58,8 @@ pub struct TaskContext {
     checkpoints: Arc<Mutex<HashMap<String, Value>>>,
     /// Counts each base name's occurrences within this execution.
     checkpoint_counts: Arc<Mutex<HashMap<String, usize>>>,
-    /// Carries an event timeout to deliver once across context clones.
-    pending_event_timeout: Arc<Mutex<Option<String>>>,
+    /// Serializes event outcomes while delivering a resumed timeout across clones.
+    pending_event_timeout: Arc<AsyncMutex<Option<String>>>,
     /// Carries the claim extension used by checkpoint writes.
     checkpoint_extend_by: Option<Duration>,
 }
@@ -79,7 +82,7 @@ impl TaskContext {
             activity: None,
             checkpoints: Arc::new(Mutex::new(checkpoints)),
             checkpoint_counts: Arc::default(),
-            pending_event_timeout: Arc::new(Mutex::new(
+            pending_event_timeout: Arc::new(AsyncMutex::new(
                 run.wake_event
                     .clone()
                     .filter(|_| run.event_payload.is_none()),
@@ -245,22 +248,32 @@ impl TaskContext {
     {
         let event_name = event_name.as_ref().parse::<EventName>()?;
         let step_name = self.next_checkpoint_name(step_name.as_ref())?;
+        let mut pending_timeout = self.pending_event_timeout.lock().await;
+        let timeout_key = format!("$elephant:awaitEventTimeout:{step_name}");
+        let pending_step = self.checkpoint_value(EVENT_WAIT_CHECKPOINT);
+        let is_pending_timeout = pending_timeout.as_deref() == Some(event_name.as_str())
+            && pending_step
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_none_or(|pending| pending == step_name.as_str());
+        if self.checkpoint_value(&timeout_key).is_some() {
+            if is_pending_timeout {
+                pending_timeout.take();
+            }
+            return Err(Error::EventTimeout);
+        }
         if let Some(payload) = self.checkpoint_value(step_name.as_str()) {
             return serde_json::from_value(payload).map_err(Error::json);
         }
-        {
-            let mut pending_timeout = self
-                .pending_event_timeout
-                .lock()
-                .expect("event timeout lock poisoned");
-            if pending_timeout.as_deref() == Some(event_name.as_str()) {
-                pending_timeout.take();
-                return Err(Error::EventTimeout);
-            }
+        if is_pending_timeout {
+            self.persist_checkpoint(&timeout_key, Value::Bool(true))
+                .await?;
+            pending_timeout.take();
+            return Err(Error::EventTimeout);
         }
         let raw = self
             .client
-            .await_event_raw(
+            .await_event_durable(
                 self.metadata.queue_name.as_str(),
                 self.metadata.task_id.as_uuid(),
                 self.metadata.run_id.as_uuid(),
@@ -270,14 +283,12 @@ impl TaskContext {
             )
             .await?;
         if raw.should_suspend {
+            self.insert_checkpoint(EVENT_WAIT_CHECKPOINT, Value::String(step_name.to_string()));
             return Err(Error::Suspended);
         }
-        let persisted = raw.payload.is_some();
         let payload = raw.payload.unwrap_or(Value::Null);
         self.insert_checkpoint(step_name.as_str(), payload.clone());
-        if persisted {
-            self.record_progress(None);
-        }
+        self.record_progress(None);
         serde_json::from_value(payload).map_err(Error::json)
     }
 
@@ -409,6 +420,13 @@ impl TaskContext {
 
     /// Allocates the next occurrence of a base checkpoint name.
     fn next_checkpoint_name(&self, name: &str) -> Result<StepName> {
+        if name.starts_with("$elephant:") {
+            return Err(Error::InvalidName {
+                kind: "step",
+                value: name.to_string(),
+                reason: "the $elephant: prefix is reserved for SDK checkpoints",
+            });
+        }
         let name = name.parse::<StepName>()?;
         let mut counts = self
             .checkpoint_counts

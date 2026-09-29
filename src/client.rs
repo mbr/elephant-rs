@@ -22,6 +22,9 @@ use crate::{
     worker::{ClaimOptions, ClaimStream, WorkerBuilder},
 };
 
+/// Records the checkpoint name associated with the run's current event wait.
+pub(crate) const EVENT_WAIT_CHECKPOINT: &str = "$elephant:awaitEventPending";
+
 /// Provides typed access to Absurd stored procedures.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -399,19 +402,17 @@ impl Client {
         owner_run: Uuid,
         extend_claim_by: Option<Duration>,
     ) -> Result<()> {
-        let queue_name = QueueName::from_str(queue_name.as_ref())?;
-        let step_name = StepName::from_str(step_name.as_ref())?;
-        let payload = serde_json::to_value(state).map_err(Error::json)?;
-        sqlx::query("SELECT absurd.set_task_checkpoint_state($1, $2, $3, $4::jsonb, $5, $6)")
-            .bind(queue_name.as_str())
-            .bind(task_id)
-            .bind(step_name.as_str())
-            .bind(Json(payload))
-            .bind(owner_run)
-            .bind(extend_claim_by.map(seconds_i32).transpose()?)
-            .execute(&self.pool)
-            .await
-            .map_err(Error::from_sqlx)?;
+        checkpoint_query(
+            queue_name.as_ref(),
+            task_id,
+            step_name.as_ref(),
+            state,
+            owner_run,
+            extend_claim_by,
+        )?
+        .execute(&self.pool)
+        .await
+        .map_err(Error::from_sqlx)?;
         Ok(())
     }
 
@@ -478,29 +479,51 @@ impl Client {
         event_name: impl AsRef<str>,
         timeout: Option<Duration>,
     ) -> Result<AwaitEventRaw> {
-        let queue_name = QueueName::from_str(queue_name.as_ref())?;
-        let step_name = StepName::from_str(step_name.as_ref())?;
-        let event_name = EventName::from_str(event_name.as_ref())?;
-        let timeout = timeout.map(seconds_i32).transpose()?;
-        let row = sqlx::query(
-            "SELECT should_suspend, payload FROM absurd.await_event($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(queue_name.as_str())
-        .bind(task_id)
-        .bind(run_id)
-        .bind(step_name.as_str())
-        .bind(event_name.as_str())
-        .bind(timeout)
+        let row = event_wait_query(
+            queue_name.as_ref(),
+            task_id,
+            run_id,
+            step_name.as_ref(),
+            event_name.as_ref(),
+            timeout,
+        )?
         .fetch_one(&self.pool)
         .await
         .map_err(Error::from_sqlx)?;
-        Ok(AwaitEventRaw {
-            should_suspend: row.try_get("should_suspend").map_err(Error::from_sqlx)?,
-            payload: row
-                .try_get::<Option<Json<Value>>, _>("payload")
-                .map_err(Error::from_sqlx)?
-                .map(|payload| payload.0),
-        })
+        row_to_event_wait(row)
+    }
+
+    /// Atomically records event wake identity or a null timeout acknowledgement.
+    pub(crate) async fn await_event_durable(
+        &self,
+        queue_name: &str,
+        task_id: Uuid,
+        run_id: Uuid,
+        step_name: &str,
+        event_name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<AwaitEventRaw> {
+        let query = event_wait_query(queue_name, task_id, run_id, step_name, event_name, timeout)?;
+        let mut transaction = self.pool.begin().await?;
+        let raw = row_to_event_wait(query.fetch_one(&mut *transaction).await?)?;
+        if raw.should_suspend {
+            checkpoint_query(
+                queue_name,
+                task_id,
+                EVENT_WAIT_CHECKPOINT,
+                step_name,
+                run_id,
+                None,
+            )?
+            .execute(&mut *transaction)
+            .await?;
+        } else if raw.payload.is_none() {
+            checkpoint_query(queue_name, task_id, step_name, Value::Null, run_id, None)?
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(raw)
     }
 
     /// Emits an immutable queue event.
@@ -894,6 +917,57 @@ pub struct AwaitEventRaw {
     pub should_suspend: bool,
     /// Carries the event payload when available.
     pub payload: Option<Value>,
+}
+
+/// Builds a validated checkpoint write for a pool or caller-owned transaction.
+fn checkpoint_query<T: Serialize>(
+    queue_name: &str,
+    task_id: Uuid,
+    step_name: &str,
+    state: T,
+    owner_run: Uuid,
+    extend_claim_by: Option<Duration>,
+) -> Result<sqlx::query::Query<'static, sqlx::Postgres, sqlx::postgres::PgArguments>> {
+    Ok(
+        sqlx::query("SELECT absurd.set_task_checkpoint_state($1, $2, $3, $4::jsonb, $5, $6)")
+            .bind(QueueName::from_str(queue_name)?.into_string())
+            .bind(task_id)
+            .bind(StepName::from_str(step_name)?.to_string())
+            .bind(Json(serde_json::to_value(state).map_err(Error::json)?))
+            .bind(owner_run)
+            .bind(extend_claim_by.map(seconds_i32).transpose()?),
+    )
+}
+
+/// Builds a validated event wait for a pool or caller-owned transaction.
+fn event_wait_query(
+    queue_name: &str,
+    task_id: Uuid,
+    run_id: Uuid,
+    step_name: &str,
+    event_name: &str,
+    timeout: Option<Duration>,
+) -> Result<sqlx::query::Query<'static, sqlx::Postgres, sqlx::postgres::PgArguments>> {
+    Ok(sqlx::query(
+        "SELECT should_suspend, payload FROM absurd.await_event($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(QueueName::from_str(queue_name)?.into_string())
+    .bind(task_id)
+    .bind(run_id)
+    .bind(StepName::from_str(step_name)?.to_string())
+    .bind(EventName::from_str(event_name)?.to_string())
+    .bind(timeout.map(seconds_i32).transpose()?))
+}
+
+/// Decodes a raw event wait without conflating SQL null and JSON null.
+fn row_to_event_wait(row: sqlx::postgres::PgRow) -> Result<AwaitEventRaw> {
+    Ok(AwaitEventRaw {
+        should_suspend: row.try_get("should_suspend").map_err(Error::from_sqlx)?,
+        payload: row
+            .try_get::<Option<Json<Value>>, _>("payload")
+            .map_err(Error::from_sqlx)?
+            .map(|payload| payload.0),
+    })
 }
 
 /// Converts a row into a checkpoint snapshot.
