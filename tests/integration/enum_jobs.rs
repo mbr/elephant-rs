@@ -15,8 +15,8 @@ use elephant::{
     run::{ExecutionOptions, StallTimeout},
     task::{AbsurdJob, Router, Task, TaskExecution},
     types::{
-        CancellationPolicy, CreateQueueOptions, RetryStrategy, RunId, SpawnOptions, TaskId,
-        TaskResultState,
+        CancellationPolicy, CreateQueueOptions, PgInterval, QueuePolicyOptions, RetryStrategy,
+        RunId, SpawnOptions, Spawned, TaskId, TaskResultState,
     },
     worker::{ClaimOptions, work_batch},
 };
@@ -72,6 +72,22 @@ enum UnitJob {
 impl AbsurdJob for UnitJob {
     /// Persists successful completion as JSON null.
     type Output = ();
+}
+
+/// Carries a typed child reference in another enum job's input.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "task", content = "params")]
+enum ParentJob {
+    /// Observes the child before continuing the workflow.
+    Observe {
+        /// Retains the queue, task identity, and expected result type.
+        child: Spawned<Box<str>>,
+    },
+}
+
+impl AbsurdJob for ParentJob {
+    /// Returns the child's user-facing message.
+    type Output = Box<str>;
 }
 
 /// Distinguishes nested enum errors from unsupported outer job names.
@@ -1249,7 +1265,85 @@ async fn enum_deferral_errors_reach_worker_supervisor() -> TestResult {
 /// Replays a typed enum child result after the child task has been cleaned up.
 #[tokio::test]
 async fn enum_child_waits_replay_typed_outputs() -> TestResult {
-    todo!(
-        "Await an enum child's output through a typed handle from another queue, checkpoint it, remove the child, and replay the parent's saved observation"
+    let test = setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    test.client
+        .create_queue("children", CreateQueueOptions::default())
+        .await?;
+    let child = test
+        .client
+        .spawn_job(Job::Ping)
+        .queue("children")?
+        .send()
+        .await?;
+    work_batch(
+        &test.client,
+        &Router::from_job_handler(handle_job),
+        "children",
     )
+    .await?;
+    let parent = test
+        .client
+        .spawn_job(ParentJob::Observe {
+            child: child.clone(),
+        })
+        .max_attempts(2)
+        .retry_strategy(RetryStrategy::Fixed {
+            base: Duration::from_secs(1),
+        })
+        .send()
+        .await?;
+    let router = Router::from_job_handler(|context: TaskContext, job: ParentJob| async move {
+        let ParentJob::Observe { child } = job;
+        let budget = if context.metadata().attempt == 1 {
+            Duration::from_secs(1)
+        } else {
+            Duration::ZERO
+        };
+        let result = context.await_task_result(&child, Some(budget)).await?;
+        if context.metadata().attempt == 1 {
+            return Err(Error::handler(Box::new(TestFailure)));
+        }
+        Ok(result)
+    });
+    work_batch(&test.client, &router, "default").await?;
+    let checkpoint: Value = sqlx::query_scalar(
+        "SELECT state FROM absurd.c_default WHERE task_id = $1 AND checkpoint_name = $2",
+    )
+    .bind(parent.result.task_id.as_uuid())
+    .bind(format!("$awaitTaskResult:{}", child.result.task_id))
+    .fetch_one(test.client.pool())
+    .await?;
+    assert_eq!(checkpoint["state"], "completed");
+    assert_eq!(checkpoint["result"], "pong");
+    clock(&test.client, 2).await?;
+    test.client
+        .set_queue_policy(
+            "children",
+            QueuePolicyOptions {
+                cleanup_ttl: Some(PgInterval::from(Duration::ZERO)),
+                ..QueuePolicyOptions::default()
+            },
+        )
+        .await?;
+    let cleaned = test.client.cleanup_queue("children").await?;
+    assert_eq!(cleaned.iter().map(|row| row.tasks_deleted).sum::<i32>(), 1);
+    assert!(
+        test.client
+            .fetch_task_result("children", child.result.task_id.as_uuid())
+            .await?
+            .is_none()
+    );
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        &*parent
+            .await_result(&test.client, Some(Duration::from_secs(2)))
+            .await?,
+        "pong"
+    );
+    assert_eq!(
+        task_row(&test.client, parent.result.task_id).await?["attempts"],
+        2
+    );
+    Ok(())
 }
