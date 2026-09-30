@@ -31,7 +31,7 @@ use elephant::task::AbsurdJob;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "task", content = "params")]
+#[serde(tag = "task", content = "params")]  // IMPORTANT
 pub enum ReportJob {
     GenerateReport {
         customer_id: u64,
