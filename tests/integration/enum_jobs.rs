@@ -6,8 +6,9 @@ use elephant::{
     client::Client,
     context::TaskContext,
     error::Error,
-    task::{AbsurdJob, Router},
+    task::{AbsurdJob, Router, Task},
     types::{CancellationPolicy, CreateQueueOptions, RetryStrategy, TaskId},
+    worker::work_batch,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
@@ -45,6 +46,19 @@ enum Job {
 impl AbsurdJob for Job {
     /// Returns a user-facing message without requiring `String`.
     type Output = Box<str>;
+}
+
+/// Provides an explicit unit-output contract independent of boxed results.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "task", content = "params")]
+enum UnitJob {
+    /// Runs an operation whose completion has no additional data.
+    Cleanup,
+}
+
+impl AbsurdJob for UnitJob {
+    /// Persists successful completion as JSON null.
+    type Output = ();
 }
 
 /// Distinguishes nested enum errors from unsupported outer job names.
@@ -377,9 +391,75 @@ async fn enum_jobs_enqueue_atomically_in_caller_transactions() -> TestResult {
 /// Exchanges invocations with independently registered named handlers.
 #[tokio::test]
 async fn enum_and_named_handlers_share_the_wire_protocol() -> TestResult {
-    todo!(
-        "Dispatch enum-produced jobs with named handlers and named-produced jobs with enum handlers, including aliases and null results"
+    let test = setup().await?;
+    let named = Task::<Value, Box<str>>::builder("generate-report-v1")?
+        .handler(|_, params| async move {
+            assert_eq!(params, json!({"customer_id": 123, "year": 2026}));
+            Ok("report:123:2026".into())
+        })
+        .build();
+    let named_router = Router::new().task(named.clone())?;
+    let from_enum = test
+        .client
+        .spawn_job(Job::Generate {
+            customer_id: 123,
+            year: 2026,
+        })
+        .send()
+        .await?;
+    work_batch(&test.client, &named_router, "default").await?;
+    assert_eq!(
+        &*from_enum
+            .await_result(&test.client, Some(Duration::from_secs(2)))
+            .await?,
+        "report:123:2026"
+    );
+    let enum_router = Router::from_job_handler(handle_job);
+    for name in ["generate-report-v1", "generate-report"] {
+        let contract = Task::<Value, Box<str>>::builder(name)?.build();
+        let from_named = test
+            .client
+            .spawn(&contract, json!({"customer_id": 123, "year": 2026}))
+            .send()
+            .await?;
+        work_batch(&test.client, &enum_router, "default").await?;
+        assert_eq!(
+            &*from_named
+                .await_result(&test.client, Some(Duration::from_secs(2)))
+                .await?,
+            "report:123:2026"
+        );
+    }
+    let unit = test.client.spawn_job(UnitJob::Cleanup).send().await?;
+    let cleanup = Task::<(), ()>::builder("Cleanup")?
+        .handler(|_, ()| async { Ok(()) })
+        .build();
+    work_batch(
+        &test.client,
+        &Router::new().task(cleanup.clone())?,
+        "default",
     )
+    .await?;
+    unit.await_result(&test.client, Some(Duration::from_secs(2)))
+        .await?;
+    assert_eq!(
+        task_row(&test.client, unit.result.task_id).await?["completed_payload"],
+        Value::Null
+    );
+    let unit = test.client.spawn(&cleanup, ()).send().await?;
+    work_batch(
+        &test.client,
+        &Router::from_job_handler(|_, _: UnitJob| async { Ok(()) }),
+        "default",
+    )
+    .await?;
+    unit.await_result(&test.client, Some(Duration::from_secs(2)))
+        .await?;
+    assert_eq!(
+        task_row(&test.client, unit.result.task_id).await?["state"],
+        "completed"
+    );
+    Ok(())
 }
 
 /// Rejects mixed modes while retaining shared handlers and wrappers on cloning.
