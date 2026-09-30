@@ -12,11 +12,14 @@ use elephant::{
     client::Client,
     context::TaskContext,
     error::Error,
-    task::{AbsurdJob, Router, Task},
-    types::{CancellationPolicy, CreateQueueOptions, RetryStrategy, RunId, TaskId},
+    task::{AbsurdJob, Router, Task, TaskExecution},
+    types::{
+        CancellationPolicy, CreateQueueOptions, RetryStrategy, RunId, SpawnOptions, TaskId,
+        TaskResultState,
+    },
     worker::{ClaimOptions, work_batch},
 };
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::{sleep, timeout};
@@ -150,6 +153,91 @@ impl Serialize for EncodingFailure {
 impl AbsurdJob for EncodingFailure {
     /// Discards results for the invalid invocation.
     type Output = ();
+}
+
+/// Exercises user-defined decoding panics inside dispatch.
+#[derive(Serialize)]
+struct DecodePanic;
+
+impl<'de> Deserialize<'de> for DecodePanic {
+    /// Panics during job reconstruction.
+    ///
+    /// # Panic
+    ///
+    /// Always panics to exercise the dispatch boundary.
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        panic!("decoder panic")
+    }
+}
+
+impl AbsurdJob for DecodePanic {
+    /// Discards results from an invocation that cannot decode.
+    type Output = ();
+}
+
+/// Selects an output encoding failure after successful dispatch.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "task", content = "params")]
+enum EncodingJob {
+    /// Selects how the returned value fails to serialize.
+    Encode {
+        /// Chooses unwinding instead of a serialization error.
+        panic: bool,
+    },
+}
+
+impl AbsurdJob for EncodingJob {
+    /// Exercises serialization of a typed handler result.
+    type Output = BrokenOutput;
+}
+
+/// Fails when the runtime serializes a successful handler return value.
+#[derive(Deserialize)]
+struct BrokenOutput {
+    /// Chooses an unwind instead of an ordinary error.
+    panic: bool,
+}
+
+impl Serialize for BrokenOutput {
+    /// Produces the requested output encoding failure.
+    ///
+    /// # Panic
+    ///
+    /// Panics when the test requests unwinding during serialization.
+    fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        assert!(!self.panic, "output serialization panic");
+        Err(serde::ser::Error::custom("output encoding failed"))
+    }
+}
+
+/// Panics before returning a handler future.
+///
+/// # Panic
+///
+/// Always panics to exercise handler construction.
+fn panic_on_construction(
+    _context: TaskContext,
+    _job: Job,
+) -> std::future::Ready<elephant::error::Result<Box<str>>> {
+    panic!("handler construction panic")
+}
+
+/// Panics while polling the handler future.
+///
+/// # Panic
+///
+/// Always panics to exercise async execution.
+async fn panic_during_poll(_context: TaskContext, _job: Job) -> elephant::error::Result<Box<str>> {
+    panic!("handler polling panic")
+}
+
+/// Panics before returning an execution-wrapper future.
+///
+/// # Panic
+///
+/// Always panics to exercise wrapper construction.
+fn panic_in_wrapper(_context: TaskContext, _execute: TaskExecution) -> TaskExecution {
+    panic!("wrapper construction panic")
 }
 
 /// Rejects malformed serialization before acquiring a database connection.
@@ -851,9 +939,110 @@ async fn enum_handlers_preserve_wrappers_and_owning_control_signals() -> TestRes
 /// Contains application panics and output encoding failures within the run.
 #[tokio::test]
 async fn enum_dispatch_converts_panics_and_serialization_errors() -> TestResult {
-    todo!(
-        "Catch decoder, handler construction, handler polling, and output serialization panics; persist serializer errors without completing or deferring the job"
+    let test = setup().await?;
+    let encoding = Router::from_job_handler(|_, job: EncodingJob| async move {
+        let EncodingJob::Encode { panic } = job;
+        Ok(BrokenOutput { panic })
+    });
+    for (router, name, params, category, message) in [
+        (
+            Router::from_job_handler(|_, _: DecodePanic| async { Ok(()) }),
+            "DecodePanic",
+            Value::Null,
+            "panic",
+            "decoder panic",
+        ),
+        (
+            Router::from_job_handler(panic_on_construction),
+            "Ping",
+            Value::Null,
+            "panic",
+            "handler construction panic",
+        ),
+        (
+            Router::from_job_handler(panic_during_poll),
+            "Ping",
+            Value::Null,
+            "panic",
+            "handler polling panic",
+        ),
+        (
+            encoding.clone(),
+            "Encode",
+            json!({"panic": true}),
+            "panic",
+            "output serialization panic",
+        ),
+        (
+            encoding,
+            "Encode",
+            json!({"panic": false}),
+            "elephant_error",
+            "output encoding failed",
+        ),
+        (
+            Router::from_job_handler(handle_job).wrap_execution(panic_in_wrapper),
+            "Ping",
+            Value::Null,
+            "panic",
+            "wrapper construction panic",
+        ),
+        (
+            Router::from_job_handler(handle_job)
+                .wrap_execution(|_, _| async { panic!("wrapper polling panic") }),
+            "Ping",
+            Value::Null,
+            "panic",
+            "wrapper polling panic",
+        ),
+    ] {
+        let handle = test
+            .client
+            .spawn_untyped(
+                name,
+                params,
+                SpawnOptions {
+                    max_attempts: Some(1),
+                    ..SpawnOptions::default()
+                },
+            )
+            .await?;
+        work_batch(&test.client, &router, "default").await?;
+        let snapshot = test
+            .client
+            .await_task_result(
+                "default",
+                handle.task_id.as_uuid(),
+                Some(Duration::from_secs(2)),
+            )
+            .await?;
+        assert_eq!(snapshot.state, TaskResultState::Failed);
+        assert!(snapshot.result.is_none());
+        let failure = snapshot.failure.expect("persisted failure");
+        assert_eq!(failure["name"], category);
+        assert!(
+            failure["message"]
+                .as_str()
+                .expect("failure message")
+                .contains(message),
+            "{failure}"
+        );
+        assert_eq!(task_row(&test.client, handle.task_id).await?["attempts"], 1);
+    }
+    let valid = test.client.spawn_job(Job::Ping).send().await?;
+    work_batch(
+        &test.client,
+        &Router::from_job_handler(handle_job),
+        "default",
     )
+    .await?;
+    assert_eq!(
+        &*valid
+            .await_result(&test.client, Some(Duration::from_secs(2)))
+            .await?,
+        "pong"
+    );
+    Ok(())
 }
 
 /// Renews active enum jobs and drains them after worker shutdown is requested.
