@@ -45,6 +45,7 @@ pub enum ReportJob {
 Now we can set up a client and use it to enqueue jobs:
 
 ```rust
+// client.rs
 use elephant::client::Client;
 use sqlx::PgPool;
 
@@ -62,6 +63,56 @@ client
     .await?;
 ```
 
+Now we can implement the worker code:
+
+```rust
+// worker.rs
+use elephant::{client::Client, context::TaskContext, error::Result, task::Router};
+use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
+
+use jobs::ReportJob;
+use reports::{calculate, delete_report, load_data, render_pdf};
+
+/// Executes a report job using durable steps.
+async fn handle_job(context: TaskContext, job: ReportJob) -> Result<()> {
+    match job {
+        ReportJob::GenerateReport { customer_id, year } => {
+            let data = context
+                .step("load-data", || load_data(customer_id, year))
+                .await?;
+            let aggregates = context
+                .step("calculate", || calculate(&data))
+                .await?;
+            let report_key = format!("reports/{customer_id}/{year}.pdf");
+            context
+                .step("render-pdf", || render_pdf(&aggregates, &report_key))
+                .await
+        }
+        ReportJob::DeleteReport { report_key } => {
+            context
+                .step("delete-report", || delete_report(&report_key))
+                .await
+        }
+    }
+}
+
+/// Runs the report worker process.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let pool = PgPool::connect("postgresql://localhost/myapp").await?;
+    let client = Client::builder(pool).default_queue("reports")?.build();
+    let router = Router::from_job_handler(handle_job);
+
+    client
+        .worker(router)
+        .concurrency(2)
+        .run(CancellationToken::new())
+        .await
+}
+```
+
+The `reports` helpers are application code: they load data, calculate aggregates, store a PDF at `report_key`, or delete it. They return `elephant::error::Result<T>`, and step results must support Serde serialization and deserialization. Make storage and deletion idempotent: a crash before the checkpoint is saved can cause a step to run again.
 
 ---
 
