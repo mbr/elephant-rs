@@ -14,9 +14,21 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     context::TaskContext,
     error::{Error, Result},
-    run::{ExecutionOptions, LeaseRenewal, RunLease},
+    job,
+    run::{ExecutionOptions, LeaseRenewal, RunLease, RunOutcome},
     types::{CancellationPolicy, QueueName, TaskName},
 };
+
+/// Shares an enum job's input and output contract between producers and workers.
+///
+/// Use `#[serde(tag = "task", content = "params")]` on the job enum. Its serialized
+/// variant name becomes the database task name; only the content is stored as
+/// parameters. Queue selection belongs to the client or spawn builder. Declare
+/// [`Self::Output`] explicitly, using `()` when no result is needed.
+pub trait AbsurdJob: Serialize + DeserializeOwned {
+    /// Defines the successful result shared by all variants of this job enum.
+    type Output: Serialize + DeserializeOwned;
+}
 
 /// Describes a typed task independently of its executable implementation.
 pub struct Task<P, R> {
@@ -222,11 +234,57 @@ pub type TaskExecution = BoxFuture<'static, Result<Value>>;
 /// Wraps an invocation with application-level execution context.
 type ExecutionWrapper = dyn Fn(TaskContext, TaskExecution) -> TaskExecution + Send + Sync;
 
-/// Routes claimed runs to registered handlers.
+/// Binds a decoded invocation to the context created for its claimed run.
+type PreparedExecution = Box<dyn FnOnce(TaskContext) -> TaskExecution + Send>;
+
+/// Decodes an enum invocation without treating unsupported tags as failures.
+type JobDecoder = dyn Fn(&TaskName, Value) -> Result<Option<PreparedExecution>> + Send + Sync;
+
+/// Selects one mutually exclusive dispatch strategy.
+#[derive(Clone)]
+enum DispatchMode {
+    /// Shares an immutable named-handler registry.
+    Named(Arc<HashMap<TaskName, Arc<ErasedTask>>>),
+    /// Reconstructs an enum and binds it to a single application handler.
+    Jobs(Arc<JobDecoder>),
+}
+
+impl DispatchMode {
+    /// Resolves a handler without loading checkpoints for unsupported tasks.
+    fn prepare(
+        &self,
+        name: &TaskName,
+        queue: &QueueName,
+        params: Value,
+    ) -> Result<Option<PreparedExecution>> {
+        match self {
+            Self::Named(tasks) => {
+                let Some(task) = tasks.get(name).cloned() else {
+                    return Ok(None);
+                };
+                if let Some(expected) = &task.queue_name
+                    && expected != queue
+                {
+                    return Err(Error::TaskQueueMismatch {
+                        task_name: name.to_string(),
+                        expected: expected.to_string(),
+                        actual: queue.to_string(),
+                    });
+                }
+                Ok(Some(Box::new(move |context| {
+                    (task.handler)(context, params)
+                })))
+            }
+            Self::Jobs(decode) => decode(name, params),
+        }
+    }
+}
+
+/// Routes claimed runs through named registrations or one enum job handler.
 #[derive(Clone)]
 pub struct Router {
-    /// Shares the immutable dispatch table between active runs.
-    tasks: Arc<HashMap<TaskName, Arc<ErasedTask>>>,
+    /// Shares the selected dispatch strategy between active runs.
+    dispatch: DispatchMode,
     /// Installs application context around all registered handlers.
     execution_wrapper: Option<Arc<ExecutionWrapper>>,
     /// Carries the unknown-task deferral range.
@@ -237,7 +295,7 @@ impl Default for Router {
     /// Creates an empty router with unknown-task deferral enabled.
     fn default() -> Self {
         Self {
-            tasks: Arc::new(HashMap::new()),
+            dispatch: DispatchMode::Named(Arc::new(HashMap::new())),
             execution_wrapper: None,
             unknown_task_delay: Duration::from_secs(5),
         }
@@ -250,16 +308,50 @@ impl Router {
         Self::default()
     }
 
-    /// Registers a local handler for a typed contract.
+    /// Routes an adjacently tagged job enum through one typed handler.
+    ///
+    /// Unknown outer tags defer the same run; malformed known parameters fail
+    /// the invocation. Named registrations cannot be added to this router.
+    pub fn from_job_handler<J, F, Fut>(handler: F) -> Self
+    where
+        J: AbsurdJob + Send + 'static,
+        J::Output: Send + 'static,
+        F: Fn(TaskContext, J) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<J::Output>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        let decode = move |name: &TaskName, params: Value| -> Result<Option<PreparedExecution>> {
+            let Some(job) = job::decode::<J>(name, params)? else {
+                return Ok(None);
+            };
+            let handler = Arc::clone(&handler);
+            Ok(Some(Box::new(move |context| {
+                async move {
+                    let output = handler(context, job).await?;
+                    serde_json::to_value(output).map_err(Error::json)
+                }
+                .boxed()
+            })))
+        };
+        Self {
+            dispatch: DispatchMode::Jobs(Arc::new(decode)),
+            ..Self::default()
+        }
+    }
+
+    /// Registers a local handler, rejecting duplicate names and enum-mode routers.
     pub fn task<P, R>(mut self, task: TaskRegistration<P, R>) -> Result<Self> {
-        if self.tasks.contains_key(task.name()) {
+        let DispatchMode::Named(tasks) = &mut self.dispatch else {
+            return Err(Error::MixedRouterModes);
+        };
+        if tasks.contains_key(task.name()) {
             return Err(Error::InvalidName {
                 kind: "task",
                 value: task.name().to_string(),
                 reason: "is already registered",
             });
         }
-        Arc::make_mut(&mut self.tasks).insert(task.name().clone(), task.erased);
+        Arc::make_mut(tasks).insert(task.name().clone(), task.erased);
         Ok(self)
     }
 
@@ -309,24 +401,18 @@ impl Router {
     pub async fn dispatch_with(&self, lease: RunLease, options: ExecutionOptions) -> Result<()> {
         options.validate(lease.claimed_run().claim_timeout)?;
         let client = lease.client().clone();
-        let run = lease.claimed_run().clone();
-        let Some(task) = self.tasks.get(&run.task_name).cloned() else {
-            return self.defer_unknown(lease).await;
-        };
+        let mut run = lease.claimed_run().clone();
+        let dispatch = self.dispatch.clone();
+        let unknown_task_delay = self.unknown_task_delay;
         let cancellation = CancellationToken::new();
         let context_cancellation = cancellation.clone();
         let activity = lease.activity();
         let wrapper = self.execution_wrapper.clone();
         let execute = async move {
-            if let Some(expected) = &task.queue_name
-                && expected != &run.queue_name
-            {
-                return Err(Error::TaskQueueMismatch {
-                    task_name: run.task_name.to_string(),
-                    expected: expected.to_string(),
-                    actual: run.queue_name.to_string(),
-                });
-            }
+            let params = std::mem::take(&mut run.params);
+            let Some(invoke) = dispatch.prepare(&run.task_name, &run.queue_name, params)? else {
+                return Ok(RunOutcome::Deferred(jitter_duration(unknown_task_delay)));
+            };
             let checkpoints = client
                 .get_checkpoints(
                     run.queue_name.as_str(),
@@ -339,14 +425,15 @@ impl Router {
             let context = TaskContext::new(client, &run, checkpoints)
                 .with_supervision(context_cancellation, activity);
             let wrapped_context = context.clone();
-            let execute = async move { (task.handler)(context, run.params).await }.boxed();
-            match wrapper {
+            let execute = async move { invoke(context).await }.boxed();
+            let result = match wrapper {
                 Some(wrapper) => wrapper(wrapped_context, execute).await,
                 None => execute.await,
-            }
+            };
+            result.map(RunOutcome::Completed)
         };
         lease
-            .run_supervised(
+            .run_supervised_outcome(
                 async move {
                     AssertUnwindSafe(execute)
                         .catch_unwind()
@@ -357,15 +444,6 @@ impl Router {
                 cancellation,
             )
             .await
-    }
-
-    /// Defers a run with an unknown task name.
-    async fn defer_unknown(&self, lease: RunLease) -> Result<()> {
-        let jitter = jitter_duration(self.unknown_task_delay);
-        match lease.sleep_for(jitter).await {
-            Ok(()) | Err(Error::Cancelled | Error::RunAlreadyFailed) => Ok(()),
-            Err(error) => Err(error),
-        }
     }
 }
 

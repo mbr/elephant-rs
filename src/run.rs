@@ -349,6 +349,25 @@ impl RunLease {
         T: Serialize,
         Fut: Future<Output = Result<T>>,
     {
+        self.run_supervised_outcome(
+            async move { future.await.map(RunOutcome::Completed) },
+            options,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Supervises routed execution before completing or deferring its run.
+    pub(crate) async fn run_supervised_outcome<T, Fut>(
+        self,
+        future: Fut,
+        options: ExecutionOptions,
+        cancellation: CancellationToken,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        Fut: Future<Output = Result<RunOutcome<T>>>,
+    {
         options.validate(self.claimed_run().claim_timeout)?;
         let client = self.client.clone();
         let run = self.claimed_run().clone();
@@ -406,16 +425,25 @@ impl RunLease {
                 ignore_terminal_error(Err(error))
             }
             ExecutionStop::Stalled => {
-                self.resolve_supervised(Err::<T, _>(Error::ExecutionStalled), resolution_timeout)
-                    .await
+                self.resolve_supervised(
+                    Err::<RunOutcome<T>, _>(Error::ExecutionStalled),
+                    resolution_timeout,
+                )
+                .await
             }
             ExecutionStop::TimedOut => {
-                self.resolve_supervised(Err::<T, _>(Error::ExecutionTimedOut), resolution_timeout)
-                    .await
+                self.resolve_supervised(
+                    Err::<RunOutcome<T>, _>(Error::ExecutionTimedOut),
+                    resolution_timeout,
+                )
+                .await
             }
             ExecutionStop::Cancelled => {
-                self.resolve_supervised(Err::<T, _>(Error::ExecutionCancelled), resolution_timeout)
-                    .await
+                self.resolve_supervised(
+                    Err::<RunOutcome<T>, _>(Error::ExecutionCancelled),
+                    resolution_timeout,
+                )
+                .await
             }
         }
     }
@@ -423,10 +451,19 @@ impl RunLease {
     /// Bounds terminal database writes so resolution cannot stall worker capacity.
     async fn resolve_supervised<T: Serialize>(
         self,
-        result: Result<T>,
+        result: Result<RunOutcome<T>>,
         duration: Duration,
     ) -> Result<()> {
-        timeout(duration, self.run(async { result }))
+        let resolve = async move {
+            match result {
+                Ok(RunOutcome::Completed(value)) => self.run(async { Ok(value) }).await,
+                Ok(RunOutcome::Deferred(delay)) => {
+                    ignore_terminal_error(self.sleep_for(delay).await)
+                }
+                Err(error) => self.run(async { Err::<T, _>(error) }).await,
+            }
+        };
+        timeout(duration, resolve)
             .await
             .map_err(|_| Error::RunResolutionTimeout)?
     }
@@ -468,6 +505,14 @@ impl RunLease {
     fn take_run(&mut self) -> ClaimedRun {
         self.run.take().expect("run lease must contain a run")
     }
+}
+
+/// Selects a supervised run's database resolution without exposing control errors.
+pub(crate) enum RunOutcome<T> {
+    /// Persists the handler's successful result.
+    Completed(T),
+    /// Reschedules an unsupported task without failing its run.
+    Deferred(Duration),
 }
 
 /// Identifies why execution was interrupted without conflating task results.

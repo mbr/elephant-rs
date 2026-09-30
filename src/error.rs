@@ -80,6 +80,22 @@ pub enum Error {
         /// Explains the validation failure.
         reason: &'static str,
     },
+    /// Indicates that a serialized job does not have the supported envelope.
+    #[error("invalid job envelope: {reason}")]
+    InvalidJobEnvelope {
+        /// Explains the representation mismatch without logging the payload.
+        reason: &'static str,
+    },
+    /// Indicates that named registrations were added to an enum-mode router.
+    #[error("named task registrations cannot be added to an enum job router")]
+    MixedRouterModes,
+    /// Indicates that known job parameters could not be decoded.
+    #[error("job decoding failed")]
+    JobDecode {
+        /// Retains the decoding path and original JSON error.
+        #[source]
+        source: serde_path_to_error::Error<JsonError>,
+    },
     /// Indicates that worker configuration cannot make progress.
     #[error("invalid worker options: {reason}")]
     InvalidWorkerOptions {

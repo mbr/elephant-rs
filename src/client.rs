@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::{
     error::{Error, Result},
+    job,
     run::{ClaimedRun, RunLease},
-    task::Task,
+    task::{AbsurdJob, Task},
     types::{
         CancellationPolicy, CheckpointSnapshot, CleanupResult, CreateQueueOptions, EventName,
         QueueName, QueuePolicy, QueuePolicyOptions, RetryStrategy, RetryTaskOptions, RunId,
@@ -175,11 +176,30 @@ impl Client {
     {
         SpawnBuilder {
             client: self.clone(),
-            task_name: task.name().clone(),
+            payload: SpawnPayload::Named {
+                task_name: task.name().clone(),
+                params,
+            },
             queue_name: task.queue_name().cloned(),
             default_max_attempts: task.default_max_attempts().or(self.default_max_attempts),
             default_cancellation: task.default_cancellation().cloned(),
-            params,
+            options: SpawnOptions::default(),
+            marker: PhantomData,
+        }
+    }
+
+    /// Builds an enum job invocation with its shared output type.
+    ///
+    /// The job must serialize with `#[serde(tag = "task", content = "params")]`.
+    /// Sending validates and splits this envelope before accessing the database.
+    /// Queue selection and spawn options are independent of the job contract.
+    pub fn spawn_job<J: AbsurdJob>(&self, job: J) -> SpawnBuilder<J, J::Output> {
+        SpawnBuilder {
+            client: self.clone(),
+            payload: SpawnPayload::Job(job),
+            queue_name: None,
+            default_max_attempts: self.default_max_attempts,
+            default_cancellation: None,
             options: SpawnOptions::default(),
             marker: PhantomData,
         }
@@ -757,21 +777,46 @@ impl ClientBuilder {
     }
 }
 
+/// Retains an invocation until its wire representation is needed.
+#[derive(Debug)]
+enum SpawnPayload<P> {
+    /// Carries a named contract and its typed input.
+    Named {
+        /// Identifies the operation independently of its input.
+        task_name: TaskName,
+        /// Holds the operation's arguments.
+        params: P,
+    },
+    /// Carries an adjacently tagged enum invocation.
+    Job(P),
+}
+
+impl<P: Serialize> SpawnPayload<P> {
+    /// Produces the shared protocol's task name and parameter payload.
+    fn encode(self) -> Result<(TaskName, Value)> {
+        match self {
+            Self::Named { task_name, params } => Ok((
+                task_name,
+                serde_json::to_value(params).map_err(Error::json)?,
+            )),
+            Self::Job(job) => job::encode(job),
+        }
+    }
+}
+
 /// Builds a typed task spawn call.
 #[derive(Debug)]
 pub struct SpawnBuilder<P, R> {
     /// Holds the client.
     client: Client,
-    /// Names the task.
-    task_name: TaskName,
-    /// Carries the target queue.
+    /// Holds the invocation and its encoding strategy.
+    payload: SpawnPayload<P>,
+    /// Carries the contract's bound queue.
     queue_name: Option<QueueName>,
     /// Carries the default maximum attempts.
     default_max_attempts: Option<i32>,
     /// Carries the default cancellation policy.
     default_cancellation: Option<CancellationPolicy>,
-    /// Carries task parameters.
-    params: P,
     /// Carries spawn options.
     options: SpawnOptions,
     /// Carries the result marker.
@@ -785,16 +830,17 @@ where
     /// Sets the target queue.
     pub fn queue(mut self, queue_name: impl AsRef<str>) -> Result<Self> {
         let queue_name = QueueName::from_str(queue_name.as_ref())?;
-        if let Some(expected) = &self.queue_name
+        if let SpawnPayload::Named { task_name, .. } = &self.payload
+            && let Some(expected) = &self.queue_name
             && expected != &queue_name
         {
             return Err(Error::TaskQueueMismatch {
-                task_name: self.task_name.to_string(),
+                task_name: task_name.to_string(),
                 expected: expected.to_string(),
                 actual: queue_name.to_string(),
             });
         }
-        self.queue_name = Some(queue_name);
+        self.options.queue_name = Some(queue_name);
         Ok(self)
     }
 
@@ -830,17 +876,24 @@ where
 
     /// Sends the spawn request.
     pub async fn send(self) -> Result<Spawned<R>> {
-        let mut connection = self.client.pool.acquire().await?;
-        self.send_on(&mut connection).await
+        self.send_using(None).await
     }
 
     /// Sends the spawn request using a caller-owned connection or transaction.
     ///
     /// The handle is valid outside the transaction only after a successful commit.
-    pub async fn send_on(mut self, connection: &mut PgConnection) -> Result<Spawned<R>> {
+    pub async fn send_on(self, connection: &mut PgConnection) -> Result<Spawned<R>> {
+        self.send_using(Some(connection)).await
+    }
+
+    /// Encodes the invocation before acquiring or using a database connection.
+    async fn send_using(mut self, connection: Option<&mut PgConnection>) -> Result<Spawned<R>> {
+        let (task_name, params) = self.payload.encode()?;
         let queue_name = match self
+            .options
             .queue_name
             .take()
+            .or(self.queue_name)
             .or_else(|| self.client.default_queue.clone())
         {
             Some(queue_name) => queue_name,
@@ -856,13 +909,21 @@ where
         if self.options.cancellation.is_none() {
             self.options.cancellation = self.default_cancellation.take();
         }
+        let mut pooled;
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                pooled = self.client.pool.acquire().await?;
+                &mut *pooled
+            }
+        };
         let result = self
             .client
             .spawn_raw_on(
                 connection,
                 queue_name.clone(),
-                self.task_name,
-                self.params,
+                task_name,
+                params,
                 self.options,
                 self.default_max_attempts,
             )

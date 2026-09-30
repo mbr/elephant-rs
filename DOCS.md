@@ -67,6 +67,33 @@ Deserialized names are validated. Use a stable idempotency key when spawning a
 child inside a step: a crash can occur between spawning and checkpointing its
 handle.
 
+## Enum jobs
+
+For a worker that handles one shared job enum, implement `task::AbsurdJob` and
+use Serde's `#[serde(tag = "task", content = "params")]` representation. Declare
+`type Output` explicitly: it can be a shared result structure, an enum, `()`,
+`Box<str>`, or `serde_json::Value`. The job and output both support serialization
+and owned deserialization.
+
+`client.spawn_job(job)` uses the same spawn options and transactional `send_on`
+as typed tasks, returning `Spawned<J::Output>`. Queue selection comes from the
+client default or spawn override. The adapter validates the serialized envelope
+before database access, stores its tag as the task name, and stores its content
+alone as parameters. Unit variants use JSON null parameters. Result values are
+stored directly, without an additional envelope.
+
+`Router::from_job_handler(handler)` binds an async handler taking `TaskContext`
+and the job enum, returning `Result<J::Output>`. It reconstructs the envelope
+from each claimed task. Unsupported outer tags defer the same run without
+consuming a retry; malformed known parameters fail the invocation. This
+classification uses the decoding path, not error-message parsing. Named
+registrations cannot be added to an enum router.
+
+Both router modes use the same wrappers, panic boundary, checkpoint loading,
+and execution supervision. Task names and payloads remain interoperable with
+other Absurd SDKs. Keep serialized names stable across deployments; deploy
+workers supporting new variants before producers begin submitting them.
+
 ## Atomic enqueueing
 
 `SpawnBuilder::send_on`, `Client::spawn_untyped_on`, and `Client::emit_event_on`
