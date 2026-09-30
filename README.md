@@ -11,7 +11,13 @@ curl -fL --create-dirs -o "migrations/$(date -u +%Y%m%d%H%M%S)_absurd_0.5.0.sql"
   https://github.com/earendil-works/absurd/releases/download/0.5.0/absurd.sql
 ```
 
-Once migrations ran, you can use it to create jobs.
+`absurd.sql` does not create queues. In a subsequent migration, create one for report jobs:
+
+```sql
+SELECT absurd.create_queue('reports');
+```
+
+Typically, use one queue per worker group, shared by all its instances. Once migrations have run, you can enqueue jobs.
 
 ## Example: generating a report
 
@@ -21,15 +27,37 @@ Once migrations ran, you can use it to create jobs.
 # use serde::{Deserialize, Serialize};
 // jobs.rs
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "task", content = "params")]
 enum ReportJob {
     GenerateReport {
-        // TKTK fill in fields
-    }
+        customer_id: u64,
+        year: u16,
+    },
     DeleteReport {
         report_key: String,
     }
 }
 ```
+
+Setup a client, and use it to enqueue a job.
+
+```rust
+use elephant::client::Client;
+use sqlx::PgPool;
+
+let pool = PgPool::connect("postgresql://localhost/myapp").await?;
+let client = Client::builder(pool).default_queue("reports")?.build();
+
+client
+    .spawn_job(ReportJob::GenerateReport {
+        customer_id: 123,
+        year: 2026,
+    })
+    .send()
+    .await?;
+```
+
+
 
 ---
 
