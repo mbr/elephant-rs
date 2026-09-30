@@ -22,7 +22,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{TestResult, setup, setup_with_max_connections};
+use super::{TestFailure, TestResult, setup, setup_with_max_connections};
 
 /// Covers the supported variant shapes with one shared result contract.
 #[derive(Debug, Deserialize, Serialize)]
@@ -700,9 +700,67 @@ async fn malformed_enum_params_fail_without_deferral() -> TestResult {
 /// Replays saved results across both failed attempts and durable suspension.
 #[tokio::test]
 async fn enum_jobs_replay_checkpoints_across_retries_and_suspension() -> TestResult {
-    todo!(
-        "Count expensive work once despite a retry and sleep; inspect checkpoints and verify final typed output and attempt identity"
+    let test = setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::clone(&calls);
+    let router = Router::from_job_handler(move |context: TaskContext, _: Job| {
+        let bodies = Arc::clone(&bodies);
+        async move {
+            let message: Box<str> = context
+                .step("expensive", || async move {
+                    bodies.fetch_add(1, Ordering::SeqCst);
+                    Ok("saved message".into())
+                })
+                .await?;
+            if context.metadata().attempt == 1 {
+                return Err(Error::handler(Box::new(TestFailure)));
+            }
+            context.sleep_for(Duration::from_secs(1)).await?;
+            Ok(message)
+        }
+    });
+    let handle = test
+        .client
+        .spawn_job(Job::Ping)
+        .max_attempts(2)
+        .retry_strategy(RetryStrategy::Fixed {
+            base: Duration::from_secs(1),
+        })
+        .send()
+        .await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        run_row(&test.client, handle.result.run_id).await?["state"],
+        "failed"
+    );
+    let checkpoint: Value = sqlx::query_scalar(
+        "SELECT state FROM absurd.c_default WHERE task_id = $1 AND checkpoint_name = 'expensive'",
     )
+    .bind(handle.result.task_id.as_uuid())
+    .fetch_one(test.client.pool())
+    .await?;
+    assert_eq!(checkpoint, json!("saved message"));
+    clock(&test.client, 2).await?;
+    work_batch(&test.client, &router, "default").await?;
+    let sleeping = task_row(&test.client, handle.result.task_id).await?;
+    assert_eq!(sleeping["state"], "sleeping");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    clock(&test.client, 4).await?;
+    work_batch(&test.client, &router, "default").await?;
+    assert_eq!(
+        &*handle
+            .await_result(&test.client, Some(Duration::from_secs(2)))
+            .await?,
+        "saved message"
+    );
+    let completed = task_row(&test.client, handle.result.task_id).await?;
+    assert_eq!(completed["last_attempt_run"], sleeping["last_attempt_run"]);
+    assert_eq!(completed["attempts"], 2);
+    assert_eq!(completed["task_name"], "Ping");
+    assert_eq!(completed["params"], Value::Null);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 /// Preserves wrapped owning-run control flow and application metadata.
