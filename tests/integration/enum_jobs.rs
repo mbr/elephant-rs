@@ -12,6 +12,7 @@ use elephant::{
     client::Client,
     context::TaskContext,
     error::Error,
+    run::{ExecutionOptions, StallTimeout},
     task::{AbsurdJob, Router, Task, TaskExecution},
     types::{
         CancellationPolicy, CreateQueueOptions, RetryStrategy, RunId, SpawnOptions, TaskId,
@@ -22,7 +23,10 @@ use elephant::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::Notify,
+    time::{sleep, timeout},
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{TestFailure, TestResult, setup, setup_with_max_connections};
@@ -1048,9 +1052,88 @@ async fn enum_dispatch_converts_panics_and_serialization_errors() -> TestResult 
 /// Renews active enum jobs and drains them after worker shutdown is requested.
 #[tokio::test]
 async fn enum_workers_renew_claims_and_drain_on_shutdown() -> TestResult {
-    todo!(
-        "Observe lease renewal beyond the initial claim, verify no competing claim, request shutdown while executing, and drain to one completed attempt"
-    )
+    let test = setup().await?;
+    let started = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let handler_started = Arc::clone(&started);
+    let handler_finish = Arc::clone(&finish);
+    let router = Router::from_job_handler(move |_, _: Job| {
+        let started = Arc::clone(&handler_started);
+        let finish = Arc::clone(&handler_finish);
+        async move {
+            started.notify_one();
+            finish.notified().await;
+            Ok("drained".into())
+        }
+    });
+    let handle = test
+        .client
+        .spawn_job(Job::Ping)
+        .max_attempts(1)
+        .send()
+        .await?;
+    let shutdown = CancellationToken::new();
+    let worker = test
+        .client
+        .worker(router)
+        .worker_id("enum-drain")
+        .claim_timeout(Duration::from_secs(1))
+        .execution(ExecutionOptions {
+            stall_timeout: StallTimeout::Disabled,
+            ..ExecutionOptions::default()
+        })
+        .run(shutdown.clone());
+    tokio::pin!(worker);
+    let observe = async {
+        started.notified().await;
+        let initial = run_row(&test.client, handle.result.run_id).await?;
+        let initial_expiry: jiff::Timestamp = initial["claim_expires_at"]
+            .as_str()
+            .expect("initial lease")
+            .parse()?;
+        sleep(Duration::from_millis(1200)).await;
+        let renewed = run_row(&test.client, handle.result.run_id).await?;
+        let renewed_expiry: jiff::Timestamp = renewed["claim_expires_at"]
+            .as_str()
+            .expect("renewed lease")
+            .parse()?;
+        assert!(renewed_expiry > initial_expiry);
+        assert_eq!(renewed["claimed_by"], "enum-drain");
+        assert!(
+            test.client
+                .claim_task("default", &ClaimOptions::default())
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            task_row(&test.client, handle.result.task_id).await?["state"],
+            "running"
+        );
+        shutdown.cancel();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            task_row(&test.client, handle.result.task_id).await?["state"],
+            "running"
+        );
+        finish.notify_one();
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    tokio::select! {
+        result = &mut worker => panic!("worker stopped before drain was released: {result:?}"),
+        result = timeout(Duration::from_secs(6), observe) => result??,
+    }
+    timeout(Duration::from_secs(3), &mut worker).await??;
+    assert_eq!(
+        &*handle
+            .await_result(&test.client, Some(Duration::from_secs(2)))
+            .await?,
+        "drained"
+    );
+    assert_eq!(
+        task_row(&test.client, handle.result.task_id).await?["attempts"],
+        1
+    );
+    Ok(())
 }
 
 /// Applies deadlines and local cancellation before accepting successful output.
