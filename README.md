@@ -99,13 +99,13 @@ async fn handle_job(context: TaskContext, job: ReportJob) -> Result<Box<str>> {
             context
                 .step("render-pdf", || render_pdf(&aggregates, &report_key))
                 .await?;
-            Ok(format!("Report {report_key} is ready.").into_boxed_str())
+            Ok("Report generated.".into())
         }
         ReportJob::DeleteReport { report_key } => {
             context
                 .step("delete-report", || delete_report(&report_key))
                 .await?;
-            Ok(format!("Report {report_key} was deleted.").into_boxed_str())
+            Ok("Report deleted.".into())
         }
     }
 }
