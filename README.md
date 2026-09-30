@@ -2,6 +2,12 @@
 
 [Absurd](https://earendil-works.github.io/absurd) is a Postgres-backend engine for [durable execution](https://earendil-works.github.io/absurd/concepts/) created by [Earendil Works](https://github.com/earendil-works). It has official SDKs for Go, Python and TypeScript, this crate aims to be the missing Rust SDK.
 
+Note the crate name is `elephant-rs` as it got name-squatted during the process of building this. To install run
+
+```sh
+cargo add elephant-rs
+```
+
 ## Getting started
 
 `elephant` uses [`sqlx`](https://docs.rs/sqlx/), thus the installation of `absurd.sql` can be integrated into your migrations:

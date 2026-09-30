@@ -370,7 +370,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "elephant"
+name = "elephant-rs"
 version = "0.1.0"
 dependencies = [
  "clap",
