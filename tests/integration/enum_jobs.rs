@@ -1,6 +1,12 @@
 //! Contracts, wire compatibility, and supervised execution of enum jobs.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use elephant::{
     client::Client,
@@ -465,9 +471,39 @@ async fn enum_and_named_handlers_share_the_wire_protocol() -> TestResult {
 /// Rejects mixed modes while retaining shared handlers and wrappers on cloning.
 #[tokio::test]
 async fn enum_router_rejects_named_registrations_and_clones_handlers() -> TestResult {
-    todo!(
-        "Reject adding named registrations to enum routers; execute through clones and verify shared handler and wrapper behavior"
-    )
+    let test = setup().await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let wrappers = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let wrapper_calls = Arc::clone(&wrappers);
+    let router = Router::from_job_handler(move |context, job: Job| {
+        handler_calls.fetch_add(1, Ordering::SeqCst);
+        handle_job(context, job)
+    })
+    .wrap_execution(move |_, execute| {
+        wrapper_calls.fetch_add(1, Ordering::SeqCst);
+        execute
+    });
+    let named = Task::<(), ()>::builder("named")?
+        .handler(|_, ()| async { Ok(()) })
+        .build();
+    assert!(matches!(
+        router.clone().task(named),
+        Err(Error::MixedRouterModes)
+    ));
+    for router in [router.clone(), router] {
+        let job = test.client.spawn_job(Job::Ping).send().await?;
+        work_batch(&test.client, &router, "default").await?;
+        assert_eq!(
+            &*job
+                .await_result(&test.client, Some(Duration::from_secs(2)))
+                .await?,
+            "pong"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(wrappers.load(Ordering::SeqCst), 2);
+    Ok(())
 }
 
 /// Defers unsupported tags for a capable worker without spending retry attempts.
