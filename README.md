@@ -127,4 +127,4 @@ async fn main() -> Result<()> {
 
 If a job is retried, it runs through the process, except previously successful `context.step`s will be skipped and substituted with the saved result. What `context.step` returns must thus be kept stable, at least while jobs using it are still running.
 
-Be aware that jobs can be "rerun" even outside of errors (e.g. when using `context.sleep_for`) -- all side effects outside of `context.step` are executed again, and that code must be deterministic as well.
+Be aware that jobs can be "rerun" even outside of errors (e.g. when using `context.sleep_for`) --- all side effects outside of `context.step` are executed again, and that code must be deterministic as well.
