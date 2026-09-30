@@ -13,16 +13,16 @@ use elephant::{
     context::TaskContext,
     error::Error,
     task::{AbsurdJob, Router, Task},
-    types::{CancellationPolicy, CreateQueueOptions, RetryStrategy, TaskId},
-    worker::work_batch,
+    types::{CancellationPolicy, CreateQueueOptions, RetryStrategy, RunId, TaskId},
+    worker::{ClaimOptions, work_batch},
 };
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{TestResult, setup};
+use super::{TestResult, setup, setup_with_max_connections};
 
 /// Covers the supported variant shapes with one shared result contract.
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,6 +93,37 @@ async fn task_row(client: &Client, id: TaskId) -> TestResult<Value> {
             .fetch_one(client.pool())
             .await?,
     )
+}
+
+/// Reads a run's state independently of its task snapshot.
+async fn run_row(client: &Client, id: RunId) -> TestResult<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(r) FROM absurd.r_default r WHERE run_id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(client.pool())
+            .await?,
+    )
+}
+
+/// Advances database time on fixtures restricted to one connection.
+async fn clock(client: &Client, seconds: i32) -> TestResult {
+    sqlx::query("SELECT set_config('absurd.fake_now', (TIMESTAMPTZ '2025-01-01' + make_interval(secs => $1))::text, false)")
+        .bind(seconds).execute(client.pool()).await?;
+    Ok(())
+}
+
+/// Observes an intermediate persisted state while a real worker is polled.
+async fn wait_for_state(client: &Client, id: TaskId, state: &str) -> TestResult<Value> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let row = task_row(client, id).await?;
+            if row["state"] == state {
+                return Ok(row);
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?
 }
 
 /// Supplies arbitrary serialized envelopes to the producer boundary.
@@ -509,9 +540,68 @@ async fn enum_router_rejects_named_registrations_and_clones_handlers() -> TestRe
 /// Defers unsupported tags for a capable worker without spending retry attempts.
 #[tokio::test]
 async fn unknown_enum_tags_defer_without_consuming_attempts() -> TestResult {
-    todo!(
-        "Run an older worker against a newer tag, observe sleeping state and unchanged attempt, then complete the same run with a capable worker"
-    )
+    let test = setup_with_max_connections(1).await?;
+    clock(&test.client, 0).await?;
+    let handle = test
+        .client
+        .spawn_job(UnitJob::Cleanup)
+        .max_attempts(1)
+        .send()
+        .await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let wrapper_calls = Arc::clone(&calls);
+    let old = Router::from_job_handler(handle_job)
+        .unknown_task_delay(Duration::from_secs(1))
+        .wrap_execution(move |_, execute| {
+            wrapper_calls.fetch_add(1, Ordering::SeqCst);
+            execute
+        });
+    let shutdown = CancellationToken::new();
+    let worker = test.client.worker(old.clone()).run(shutdown.clone());
+    let observe = async {
+        let result = wait_for_state(&test.client, handle.result.task_id, "sleeping").await;
+        shutdown.cancel();
+        result
+    };
+    let row = timeout(Duration::from_secs(8), async {
+        let (worker, row) = tokio::join!(worker, observe);
+        worker?;
+        row
+    })
+    .await??;
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let run = run_row(&test.client, handle.result.run_id).await?;
+    assert_eq!(run["state"], "sleeping");
+    assert!(run["failure_reason"].is_null());
+    let delay: f64 = sqlx::query_scalar("SELECT extract(epoch FROM available_at - absurd.current_time())::float8 FROM absurd.r_default WHERE run_id = $1")
+        .bind(handle.result.run_id.as_uuid()).fetch_one(test.client.pool()).await?;
+    assert!(
+        delay > 0.0 && delay <= 1.0,
+        "unexpected deferral delay: {delay}"
+    );
+    assert!(
+        test.client
+            .claim_task("default", &ClaimOptions::default())
+            .await?
+            .is_empty()
+    );
+    clock(&test.client, 2).await?;
+    let expected_run = handle.result.run_id;
+    let new = Router::from_job_handler(move |context: TaskContext, _: UnitJob| async move {
+        assert_eq!(context.metadata().run_id, expected_run);
+        assert_eq!(context.metadata().attempt, 1);
+        Ok(())
+    });
+    work_batch(&test.client, &new, "default").await?;
+    handle
+        .await_result(&test.client, Some(Duration::from_secs(2)))
+        .await?;
+    assert_eq!(
+        task_row(&test.client, handle.result.task_id).await?["attempts"],
+        1
+    );
+    Ok(())
 }
 
 /// Fails known malformed jobs without confusing nested enum errors with tags.
