@@ -21,7 +21,7 @@ echo "SELECT absurd.create_queue('reports');" \
 
 `elephant` recommends one queue per worker type due to its enum abstraction (see below). Once migrations have run, you can start queueing jobs.
 
-## Example: generating a report
+## Example
 
 `elephant` adds additional typing over the Absurd primitives using `serde`. First, define an `enum` for all jobs for a specific queue(-kind):
 
