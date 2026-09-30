@@ -908,9 +908,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgdb"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ba4edbd9491d9b9da9b54b762e14ce5b97c86185b36af96ddd86a1a2bcb544f"
+checksum = "65d3832e77d6b54f0fc71a0edb6780adde6fa5019e127891caf372beab980844"
 dependencies = [
  "envy",
  "hex_fmt",
