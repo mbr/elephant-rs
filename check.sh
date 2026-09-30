@@ -4,6 +4,11 @@
 
 set -e
 
+if [ "$(id -u)" -eq 0 ]; then
+    printf '%s\n' 'PostgreSQL tests require an unprivileged user; do not run ./check.sh as root.' >&2
+    exit 1
+fi
+
 echo "rustc $(rustc --version) at $(which rustc), cargo $(cargo --version) at $(which cargo)"
 
 ./format.sh --check
