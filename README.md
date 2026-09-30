@@ -11,24 +11,27 @@ curl -fL --create-dirs -o "migrations/$(date -u +%Y%m%d%H%M%S)_absurd_0.5.0.sql"
   https://github.com/earendil-works/absurd/releases/download/0.5.0/absurd.sql
 ```
 
-`absurd.sql` does not create queues. In a subsequent migration, create one for report jobs:
+While queues can be created programmatically, it is usually simpler to create them in an additional migration:
 
-```sql
-SELECT absurd.create_queue('reports');
+```sh
+sleep 1 # Avoid reusing the schema migration's timestamp.
+echo "SELECT absurd.create_queue('reports');" \
+  > "migrations/$(date -u +%Y%m%d%H%M%S)_reports_queue.sql"
 ```
 
-Typically, use one queue per worker group, shared by all its instances. Once migrations have run, you can enqueue jobs.
+`elephant` recommends one queue per worker type due to its enum abstraction (see below). Once migrations have run, you can start queueing jobs.
 
 ## Example: generating a report
 
-`elephant` adds additional typing over the Absurd primitives, usage is straightforward using `serde`. First, define an `enum` for all of your jobs:
+`elephant` adds additional typing over the Absurd primitives using `serde`. First, define an `enum` for all jobs for a specific queue(-kind):
 
 ```rust
-# use serde::{Deserialize, Serialize};
 // jobs.rs
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "task", content = "params")]
-enum ReportJob {
+pub enum ReportJob {
     GenerateReport {
         customer_id: u64,
         year: u16,
@@ -39,11 +42,13 @@ enum ReportJob {
 }
 ```
 
-Setup a client, and use it to enqueue a job.
+Now we can set up a client and use it to enqueue jobs:
 
 ```rust
 use elephant::client::Client;
 use sqlx::PgPool;
+
+use jobs::ReportJob;
 
 let pool = PgPool::connect("postgresql://localhost/myapp").await?;
 let client = Client::builder(pool).default_queue("reports")?.build();
@@ -56,7 +61,6 @@ client
     .send()
     .await?;
 ```
-
 
 
 ---
