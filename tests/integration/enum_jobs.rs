@@ -1,13 +1,97 @@
 //! Contracts, wire compatibility, and supervised execution of enum jobs.
 
+use elephant::{client::Client, error::Error, task::AbsurdJob};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::{Value, json};
+use sqlx::postgres::PgPoolOptions;
+
 use super::TestResult;
+
+/// Supplies arbitrary serialized envelopes to the producer boundary.
+#[derive(Deserialize, Serialize)]
+#[serde(transparent)]
+struct WireJob(Value);
+
+impl AbsurdJob for WireJob {
+    /// Discards results for producer validation probes.
+    type Output = ();
+}
+
+/// Fails serialization before an invocation reaches PostgreSQL.
+#[derive(Deserialize)]
+struct EncodingFailure;
+
+impl Serialize for EncodingFailure {
+    /// Reports an application encoding failure.
+    fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("job encoding failed"))
+    }
+}
+
+impl AbsurdJob for EncodingFailure {
+    /// Discards results for the invalid invocation.
+    type Output = ();
+}
 
 /// Rejects malformed serialization before acquiring a database connection.
 #[tokio::test]
 async fn enum_envelopes_are_validated_before_database_access() -> TestResult {
-    todo!(
-        "Reject malformed envelopes, invalid names, and serializer errors before pool acquisition; accept unit content normalization"
-    )
+    let pool = PgPoolOptions::new().connect_lazy("postgresql://localhost/unused")?;
+    pool.close().await;
+    let client = Client::builder(pool).default_queue("default")?.build();
+    for value in [
+        Value::Null,
+        json!([]),
+        json!("Unit"),
+        json!({"params": 42}),
+        json!({"task": 42}),
+        json!({"task": "known", "content": 42}),
+        json!({"task": "known", "params": 42, "extra": true}),
+    ] {
+        let error = client
+            .spawn_job(WireJob(value))
+            .send()
+            .await
+            .expect_err("invalid envelope");
+        assert!(
+            matches!(error, Error::InvalidJobEnvelope { .. }),
+            "{error:?}"
+        );
+    }
+    for name in ["", "   "] {
+        let error = client
+            .spawn_job(WireJob(json!({"task": name})))
+            .send()
+            .await
+            .expect_err("invalid task name");
+        assert!(matches!(error, Error::InvalidName { kind: "task", .. }));
+    }
+    let error = client
+        .spawn_job(EncodingFailure)
+        .send()
+        .await
+        .expect_err("encoding failure");
+    let Error::Json { source } = error else {
+        panic!("unexpected error: {error:?}")
+    };
+    assert_eq!(source.to_string(), "job encoding failed");
+    for value in [
+        json!({"task": "Unit"}),
+        json!({"task": "Unit", "params": null}),
+    ] {
+        let error = client
+            .spawn_job(WireJob(value))
+            .send()
+            .await
+            .expect_err("closed pool");
+        assert!(matches!(
+            error,
+            Error::Sqlx {
+                source: sqlx::Error::PoolClosed
+            }
+        ));
+    }
+    Ok(())
 }
 
 /// Preserves variant payloads and shared output types across real dispatch.
