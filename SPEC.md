@@ -5,7 +5,7 @@ exposes tasks, runs, checkpoints, sleeps, events, retries, cancellation, and
 queue operations directly. It is not a job-queue facade or a framework that
 owns the application's runtime.
 
-The public examples in `README.md` are compiled as doctests. This specification
+The public examples in `DOCS.md` are compiled as doctests. This specification
 records architectural boundaries and semantics rather than hypothetical APIs.
 
 ## Architecture
