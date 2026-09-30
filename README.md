@@ -52,7 +52,7 @@ impl AbsurdJob for ReportJob {
 
 Set up a client, enqueue a job, and await its result:
 
-```rust
+```rust,ignore
 // client.rs
 use elephant::client::Client;
 use sqlx::PgPool;
@@ -76,7 +76,7 @@ println!("{message}");
 
 Now we can implement the worker code:
 
-```rust
+```rust,ignore
 // worker.rs
 use elephant::{client::Client, context::TaskContext, error::Result, task::Router};
 use sqlx::PgPool;

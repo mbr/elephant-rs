@@ -1,4 +1,4 @@
-#![doc = include_str!("../DOCS.md")]
+#![doc = include_str!("../README.md")]
 
 pub mod client;
 pub mod context;
