@@ -766,9 +766,86 @@ async fn enum_jobs_replay_checkpoints_across_retries_and_suspension() -> TestRes
 /// Preserves wrapped owning-run control flow and application metadata.
 #[tokio::test]
 async fn enum_handlers_preserve_wrappers_and_owning_control_signals() -> TestResult {
-    todo!(
-        "Wrap a suspended enum handler with source-preserving errors; resume successfully and verify headers, identity, and wrapper invocations"
-    )
+    let test = setup_with_max_connections(1).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    for mode in 0..3_u64 {
+        clock(&test.client, mode as i32 * 10).await?;
+        let handle = test
+            .client
+            .spawn_job(Job::Count(mode))
+            .max_attempts(1)
+            .headers(json!({"mode": mode}))?
+            .send()
+            .await?;
+        let task_id = handle.result.task_id;
+        let run_id = handle.result.run_id;
+        let wrapper_calls = Arc::clone(&calls);
+        let router = Router::from_job_handler(move |context: TaskContext, job: Job| async move {
+            assert!(matches!(job, Job::Count(value) if value == mode));
+            match mode {
+                0 => context.sleep_for(Duration::from_secs(1)).await?,
+                1 => {
+                    context
+                        .client()
+                        .cancel_task("default", task_id.as_uuid())
+                        .await?;
+                    context.heartbeat(Duration::from_secs(30)).await?;
+                }
+                _ => {
+                    context
+                        .client()
+                        .fail_run(
+                            "default",
+                            run_id.as_uuid(),
+                            json!({"name": "original", "message": "original failure"}),
+                        )
+                        .await?;
+                    context.heartbeat(Duration::from_secs(30)).await?;
+                }
+            }
+            Ok("resumed".into())
+        })
+        .wrap_execution(move |context, execute| {
+            wrapper_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(context.metadata().task_id, task_id);
+            assert_eq!(context.metadata().run_id, run_id);
+            assert_eq!(context.metadata().task_name.as_str(), "Count");
+            assert_eq!(context.metadata().queue_name.as_str(), "default");
+            assert_eq!(context.metadata().attempt, 1);
+            assert_eq!(
+                context.metadata().headers.as_ref(),
+                Some(&json!({"mode": mode}))
+            );
+            async move {
+                execute
+                    .await
+                    .map_err(|error| Error::handler(Box::new(error)))
+            }
+        });
+        work_batch(&test.client, &router, "default").await?;
+        match mode {
+            0 => {
+                assert_eq!(task_row(&test.client, task_id).await?["state"], "sleeping");
+                clock(&test.client, 2).await?;
+                work_batch(&test.client, &router, "default").await?;
+                assert_eq!(
+                    &*handle
+                        .await_result(&test.client, Some(Duration::from_secs(2)))
+                        .await?,
+                    "resumed"
+                );
+            }
+            1 => assert_eq!(task_row(&test.client, task_id).await?["state"], "cancelled"),
+            _ => {
+                let run = run_row(&test.client, run_id).await?;
+                assert_eq!(run["state"], "failed");
+                assert_eq!(run["failure_reason"]["message"], "original failure");
+            }
+        }
+        assert_eq!(task_row(&test.client, task_id).await?["attempts"], 1);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    Ok(())
 }
 
 /// Contains application panics and output encoding failures within the run.
