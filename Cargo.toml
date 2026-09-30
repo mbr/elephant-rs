@@ -1,6 +1,6 @@
 [package]
 name = "elephant-rs"
-description = "Rust SDK for Absurd durable workflows"
+description = "Unofficial Rust SDK for Absurd durable workflows"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
