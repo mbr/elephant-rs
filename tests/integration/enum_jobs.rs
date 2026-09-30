@@ -1139,9 +1139,63 @@ async fn enum_workers_renew_claims_and_drain_on_shutdown() -> TestResult {
 /// Applies deadlines and local cancellation before accepting successful output.
 #[tokio::test]
 async fn enum_supervision_bounds_deadlines_and_local_cancellation() -> TestResult {
-    todo!(
-        "Fail a hanging enum handler on its deadline and reject late success after local cancellation"
-    )
+    let test = setup().await?;
+    for (mode, message) in [
+        ("deadline", "execution deadline expired"),
+        ("cancel", "execution was cancelled locally"),
+        (
+            "stall",
+            "execution stalled without checkpoint or heartbeat progress",
+        ),
+    ] {
+        let router = Router::from_job_handler(move |context: TaskContext, _: Job| async move {
+            if mode == "cancel" {
+                context.cancellation_token().cancel();
+                Ok("late success".into())
+            } else {
+                std::future::pending::<elephant::error::Result<Box<str>>>().await
+            }
+        });
+        let handle = test
+            .client
+            .spawn_job(Job::Ping)
+            .max_attempts(1)
+            .send()
+            .await?;
+        let lease = test
+            .client
+            .claim_task("default", &ClaimOptions::default())
+            .await?
+            .pop()
+            .expect("claimed enum job");
+        let options = ExecutionOptions {
+            timeout: (mode == "deadline").then_some(Duration::from_millis(30)),
+            stall_timeout: if mode == "stall" {
+                StallTimeout::After(Duration::from_millis(30))
+            } else {
+                StallTimeout::Disabled
+            },
+            cancellation_grace: Duration::ZERO,
+            ..ExecutionOptions::default()
+        };
+        timeout(Duration::from_secs(3), router.dispatch_with(lease, options)).await??;
+        let snapshot = test
+            .client
+            .fetch_task_result("default", handle.result.task_id.as_uuid())
+            .await?
+            .expect("failed task");
+        assert_eq!(snapshot.state, TaskResultState::Failed);
+        assert!(snapshot.result.is_none());
+        assert_eq!(
+            snapshot.failure.expect("supervision failure")["message"],
+            message
+        );
+        assert_eq!(
+            task_row(&test.client, handle.result.task_id).await?["attempts"],
+            1
+        );
+    }
+    Ok(())
 }
 
 /// Surfaces deferral persistence errors instead of converting them into retries.
