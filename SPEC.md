@@ -53,6 +53,71 @@ contains only the queue and spawn metadata, not `R`. Identifiers and names also
 support serde, with name validation applied on deserialization. Handles from
 rolled-back transactions must not be used.
 
+## Enum job interface
+
+`task::AbsurdJob` is a shared producer/worker contract requiring `Serialize` and
+`DeserializeOwned`. Its associated `Output` requires the same traits. Every
+implementation explicitly declares `Output`, including `()` for jobs without a
+meaningful result; associated-type defaults are not available on stable Rust.
+Worker registration additionally requires the job and output to be `Send + 'static`.
+
+Jobs use Serde's adjacently tagged representation with exactly `task` and `params`
+fields. `Client::spawn_job(job)` returns `SpawnBuilder<J, J::Output>` without
+requiring a local handler. On sending, serialization must produce an object with
+one string `task` field and at most one `params` field. Extra envelope fields,
+missing/non-string names, invalid task names, and serialization errors reject
+submission before acquiring a connection or executing SQL. Missing `params`
+normalizes to JSON null, supporting unit variants. Struct, tuple, and newtype
+variant contents otherwise remain ordinary JSON values.
+
+The adapter stores the serialized tag in Absurd's existing `task_name` column
+and the content alone in `params`. It does not add persistence conventions,
+checkpoints, or wrappers to results. Serde renames and aliases are honored; wire
+names and payload schemas remain application versioning contracts. Other SDKs
+can enqueue and execute these tasks using the same name and content.
+
+Queues come from an explicit spawn override or the client's default, never from
+the job trait. A missing queue is an error, and enqueueing never creates queues.
+The builder retains headers, idempotency, retry/cancellation options, client
+attempt defaults, and caller-owned transactional `send_on`. Its typed receipt is
+`Spawned<J::Output>` and uses the existing result polling/decoding APIs.
+
+`Router::from_job_handler` accepts one `Fn(TaskContext, J) -> Fut`, where
+`Fut: Future<Output = Result<J::Output>> + Send + 'static` and the handler is
+`Send + Sync + 'static`. This is an alternative mode of the existing `Router`,
+not a second worker implementation. Adding a named registration to an enum-mode
+router returns a configuration error. Cloning either router mode preserves its
+handler, wrapper, and unknown-task delay configuration.
+
+For dispatch, the router reconstructs an in-memory object containing the claimed
+string task name and raw parameters. It deserializes this object through
+`serde_path_to_error`. A `serde_json::error::Category::Data` error whose path is
+exactly the single map key `task` means this worker does not understand the tag:
+the same run is deferred with the ordinary jittered unknown-task delay, without
+failing or consuming a retry attempt. Every other decoding error is an invocation
+failure, including invalid parameter types, missing fields, and unknown nested
+enum variants. Diagnostics preserve the original error and its path. This rule
+relies on the agreed Serde representation and adapter-owned string tag, not on
+arbitrary custom deserializers behaving equivalently.
+
+Decoding, handler invocation, output serialization, checkpoint loading, wrappers,
+and panic conversion share the existing supervised dispatch pipeline. Unknown
+tags do not invoke application handlers or wrappers. Deferral is a database
+resolution operation: database failures surface to the worker supervisor rather
+than being misclassified as an application failure. Lease renewal, deadlines,
+cancellation, bounded resolution, retry policy, and durable replay remain in
+force. Outputs serialize directly, so `Box<str>` is a JSON string and `()` is JSON
+null. Applications may choose an output enum or `serde_json::Value` instead.
+
+Acceptance coverage must exercise the real worker and database in addition to
+codec behavior: envelope validation before database access; wire payloads and
+Serde aliases/unit/scalar/tuple variants; typed and null results; queue/default
+and spawn-option propagation; transactional rollback/deduplication; unknown-tag
+deferral across worker versions versus malformed known payload failure; replay;
+wrappers; panics in decoding, handler construction/polling, and serialization;
+supervision and graceful drain; failed deferral persistence; router mode rejection;
+and interoperability with the existing named-task interface.
+
 ## Database and transaction boundaries
 
 `Client::builder` wraps an existing `PgPool`. It never installs or migrates
@@ -299,7 +364,7 @@ required.
 
 `./check.sh` runs formatting checks, compilation, unit/integration tests,
 doctests, documentation, and clippy with warnings denied. Run `./format.sh`
-after successful checks. Integration tests use independent ephemeral PostgreSQL
+before checks. Integration tests use independent ephemeral PostgreSQL
 databases with the pinned fixture identified in `testdata/README.md`.
 
 Regressions cover partial-capacity execution, bounded claims, graceful shutdown,
