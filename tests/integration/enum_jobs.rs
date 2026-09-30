@@ -314,9 +314,64 @@ async fn enum_jobs_preserve_spawn_options_and_queue_selection() -> TestResult {
 /// Keeps business mutations and enum enqueueing in the caller's transaction.
 #[tokio::test]
 async fn enum_jobs_enqueue_atomically_in_caller_transactions() -> TestResult {
-    todo!(
-        "Observe uncommitted isolation, roll back business rows and jobs together, then commit and verify deduplication remains usable"
-    )
+    let test = setup().await?;
+    sqlx::query("CREATE TABLE public.requests (task_id uuid PRIMARY KEY)")
+        .execute(test.client.pool())
+        .await?;
+    for commit in [false, true] {
+        let mut transaction = test.client.pool().begin().await?;
+        let invalid = test
+            .client
+            .spawn_job(WireJob(json!({"wrong": true})))
+            .send_on(&mut transaction)
+            .await;
+        assert!(matches!(invalid, Err(Error::InvalidJobEnvelope { .. })));
+        let handle = test
+            .client
+            .spawn_job(Job::Ping)
+            .idempotency_key("transactional-ping")
+            .send_on(&mut transaction)
+            .await?;
+        assert!(handle.result.created);
+        sqlx::query("INSERT INTO public.requests (task_id) VALUES ($1)")
+            .bind(handle.result.task_id.as_uuid())
+            .execute(&mut *transaction)
+            .await?;
+        assert!(
+            test.client
+                .fetch_task_result("default", handle.result.task_id.as_uuid())
+                .await?
+                .is_none()
+        );
+        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM public.requests")
+            .fetch_one(test.client.pool())
+            .await?;
+        assert_eq!(visible, 0);
+        if commit {
+            transaction.commit().await?;
+            let duplicate = test
+                .client
+                .spawn_job(Job::Ping)
+                .idempotency_key("transactional-ping")
+                .send()
+                .await?;
+            assert_eq!(duplicate.result.task_id, handle.result.task_id);
+            assert!(!duplicate.result.created);
+        } else {
+            transaction.rollback().await?;
+            assert!(
+                test.client
+                    .fetch_task_result("default", handle.result.task_id.as_uuid())
+                    .await?
+                    .is_none()
+            );
+        }
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM public.requests), (SELECT count(*) FROM absurd.t_default)")
+            .fetch_one(test.client.pool()).await?;
+        let expected = i64::from(commit);
+        assert_eq!(counts, (expected, expected));
+    }
+    Ok(())
 }
 
 /// Exchanges invocations with independently registered named handlers.
