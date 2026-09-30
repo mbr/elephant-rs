@@ -4,7 +4,7 @@
 
 ## Getting started
 
-`elephant` uses [`sqlx`](https://docs.rs/sqlx/), thus it is recommended to integrate the installation of `absurd.sql` into your migration set:
+`elephant` uses [`sqlx`](https://docs.rs/sqlx/), thus the installation of `absurd.sql` can be integrated into your migrations:
 
 ```sh
 curl -fL --create-dirs -o "migrations/$(date -u +%Y%m%d%H%M%S)_absurd_0.5.0.sql" \
