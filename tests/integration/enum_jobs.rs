@@ -1,11 +1,79 @@
 //! Contracts, wire compatibility, and supervised execution of enum jobs.
 
-use elephant::{client::Client, error::Error, task::AbsurdJob};
+use std::time::Duration;
+
+use elephant::{
+    client::Client,
+    context::TaskContext,
+    error::Error,
+    task::{AbsurdJob, Router},
+    types::TaskId,
+};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
-use super::TestResult;
+use super::{TestResult, setup};
+
+/// Covers the supported variant shapes with one shared result contract.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "task", content = "params")]
+enum Job {
+    /// Generates a report for a customer and reporting period.
+    #[serde(rename = "generate-report-v1", alias = "generate-report")]
+    Generate {
+        /// Identifies the customer.
+        customer_id: u64,
+        /// Selects the reporting period.
+        year: u16,
+    },
+    /// Exercises a variant with no parameters.
+    Ping,
+    /// Exercises a scalar parameter payload.
+    Count(u64),
+    /// Exercises a tuple parameter payload.
+    Pair(u64, bool),
+    /// Exercises an inner discriminator sharing the envelope field name.
+    Nested {
+        /// Selects behavior within an already selected job.
+        task: Mode,
+    },
+}
+
+impl AbsurdJob for Job {
+    /// Returns a user-facing message without requiring `String`.
+    type Output = Box<str>;
+}
+
+/// Distinguishes nested enum errors from unsupported outer job names.
+#[derive(Debug, Deserialize, Serialize)]
+enum Mode {
+    /// Selects the supported nested behavior.
+    Normal,
+}
+
+/// Produces a deterministic message from each variant's decoded fields.
+async fn handle_job(_context: TaskContext, job: Job) -> elephant::error::Result<Box<str>> {
+    Ok(match job {
+        Job::Generate { customer_id, year } => format!("report:{customer_id}:{year}").into(),
+        Job::Ping => "pong".into(),
+        Job::Count(count) => count.to_string().into(),
+        Job::Pair(count, enabled) => format!("{count}:{enabled}").into(),
+        Job::Nested { task: Mode::Normal } => "nested".into(),
+    })
+}
+
+/// Reads the persisted invocation independently of SDK decoding.
+async fn task_row(client: &Client, id: TaskId) -> TestResult<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(t) FROM absurd.t_default t WHERE task_id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(client.pool())
+            .await?,
+    )
+}
 
 /// Supplies arbitrary serialized envelopes to the producer boundary.
 #[derive(Deserialize, Serialize)]
@@ -97,9 +165,69 @@ async fn enum_envelopes_are_validated_before_database_access() -> TestResult {
 /// Preserves variant payloads and shared output types across real dispatch.
 #[tokio::test]
 async fn enum_variants_preserve_wire_shapes_and_typed_results() -> TestResult {
-    todo!(
-        "Store only variant contents for struct, unit, newtype, and tuple jobs; recover typed boxed-string results through the real worker"
-    )
+    let test = setup().await?;
+    let mut expected = Vec::new();
+    for (job, name, params, message) in [
+        (
+            Job::Generate {
+                customer_id: 123,
+                year: 2026,
+            },
+            "generate-report-v1",
+            json!({"customer_id": 123, "year": 2026}),
+            "report:123:2026",
+        ),
+        (Job::Ping, "Ping", Value::Null, "pong"),
+        (
+            Job::Count(9007199254740993),
+            "Count",
+            json!(9007199254740993_u64),
+            "9007199254740993",
+        ),
+        (Job::Pair(42, false), "Pair", json!([42, false]), "42:false"),
+        (
+            Job::Nested { task: Mode::Normal },
+            "Nested",
+            json!({"task": "Normal"}),
+            "nested",
+        ),
+    ] {
+        let handle = test.client.spawn_job(job).send().await?;
+        let row = task_row(&test.client, handle.result.task_id).await?;
+        assert_eq!(row["task_name"], name);
+        assert_eq!(row["params"], params);
+        expected.push((handle, message));
+    }
+    let shutdown = CancellationToken::new();
+    let worker = test
+        .client
+        .worker(Router::from_job_handler(handle_job))
+        .concurrency(3)
+        .run(shutdown.clone());
+    let observe = async {
+        let result: TestResult = async {
+            for (handle, expected) in expected {
+                let message: Box<str> = handle
+                    .await_result(&test.client, Some(Duration::from_secs(5)))
+                    .await?;
+                assert_eq!(&*message, expected);
+                let row = task_row(&test.client, handle.result.task_id).await?;
+                assert_eq!(row["completed_payload"], expected);
+                assert_eq!(row["attempts"], 1);
+            }
+            Ok(())
+        }
+        .await;
+        shutdown.cancel();
+        result
+    };
+    timeout(Duration::from_secs(8), async {
+        let (worker, observed) = tokio::join!(worker, observe);
+        worker?;
+        observed
+    })
+    .await??;
+    Ok(())
 }
 
 /// Retains queue selection and every existing spawn option.
