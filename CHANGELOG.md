@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Upgrade `sqlx` to `0.9`, requiring Rust `1.94` or newer and `sqlx 0.9` pools and connections.
+
 ### Removed
 
 - Operational worker example, its development-only dependencies, and supporting build tooling.

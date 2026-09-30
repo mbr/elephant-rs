@@ -2447,7 +2447,7 @@ async fn worker_survives_handler_failures() -> TestResult {
 }
 
 /// Waits for a database-side fault marker that survives transaction rollback.
-async fn wait_for_database_flag(client: &Client, query: &str) -> TestResult {
+async fn wait_for_database_flag(client: &Client, query: &'static str) -> TestResult {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if sqlx::query_scalar::<_, bool>(query)
