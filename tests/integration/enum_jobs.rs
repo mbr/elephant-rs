@@ -1201,9 +1201,49 @@ async fn enum_supervision_bounds_deadlines_and_local_cancellation() -> TestResul
 /// Surfaces deferral persistence errors instead of converting them into retries.
 #[tokio::test]
 async fn enum_deferral_errors_reach_worker_supervisor() -> TestResult {
-    todo!(
-        "Inject a PostgreSQL scheduling failure for an unsupported tag, verify the worker returns that SQL error, and retain the unresolved run for lease recovery"
+    let test = setup().await?;
+    let handle = test
+        .client
+        .spawn_job(UnitJob::Cleanup)
+        .max_attempts(2)
+        .send()
+        .await?;
+    sqlx::query("CREATE OR REPLACE FUNCTION absurd.schedule_run(p_queue_name text, p_run_id uuid, p_wake_at timestamptz) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'XX000', MESSAGE = 'enum deferral unavailable'; END $$")
+        .execute(test.client.pool()).await?;
+    let error = timeout(
+        Duration::from_secs(3),
+        test.client
+            .worker(Router::from_job_handler(handle_job))
+            .run(CancellationToken::new()),
     )
+    .await?
+    .expect_err("deferral database failure must stop claiming");
+    let Error::Sqlx { source } = error else {
+        panic!("unexpected worker error: {error:?}")
+    };
+    assert_eq!(
+        source
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("XX000")
+    );
+    assert_eq!(
+        source.as_database_error().expect("server error").message(),
+        "enum deferral unavailable"
+    );
+    let task = task_row(&test.client, handle.result.task_id).await?;
+    assert_eq!(task["state"], "running");
+    assert_eq!(task["attempts"], 1);
+    let run = run_row(&test.client, handle.result.run_id).await?;
+    assert_eq!(run["state"], "running");
+    assert!(run["failure_reason"].is_null());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM absurd.r_default WHERE task_id = $1")
+        .bind(handle.result.task_id.as_uuid())
+        .fetch_one(test.client.pool())
+        .await?;
+    assert_eq!(count, 1);
+    Ok(())
 }
 
 /// Replays a typed enum child result after the child task has been cleaned up.
