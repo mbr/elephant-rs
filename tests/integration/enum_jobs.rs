@@ -607,9 +607,94 @@ async fn unknown_enum_tags_defer_without_consuming_attempts() -> TestResult {
 /// Fails known malformed jobs without confusing nested enum errors with tags.
 #[tokio::test]
 async fn malformed_enum_params_fail_without_deferral() -> TestResult {
-    todo!(
-        "Persist failures for wrong types, missing fields, and unknown nested enums including a nested task field, while valid jobs still execute"
-    )
+    let test = setup().await?;
+    let mut invalid = Vec::new();
+    for (name, params, diagnostic) in [
+        (
+            "generate-report-v1",
+            json!({"customer_id": "wrong", "year": 2026}),
+            "invalid type",
+        ),
+        (
+            "generate-report-v1",
+            json!({"customer_id": 123}),
+            "missing field",
+        ),
+        ("generate-report", Value::Null, "invalid type"),
+        ("Nested", json!({"task": "Unknown"}), "unknown variant"),
+        ("Count", json!("wrong"), "invalid type"),
+        ("Pair", json!([1]), "invalid length"),
+        ("Ping", json!({"unexpected": true}), "invalid type"),
+    ] {
+        let contract = Task::<Value, Box<str>>::builder(name)?
+            .default_max_attempts(1)
+            .build();
+        invalid.push((
+            test.client.spawn(&contract, params).send().await?,
+            diagnostic,
+        ));
+    }
+    let valid = test
+        .client
+        .spawn_job(Job::Ping)
+        .max_attempts(1)
+        .send()
+        .await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let router = Router::from_job_handler(move |context, job: Job| {
+        handler_calls.fetch_add(1, Ordering::SeqCst);
+        handle_job(context, job)
+    });
+    let shutdown = CancellationToken::new();
+    let worker = test
+        .client
+        .worker(router)
+        .concurrency(3)
+        .run(shutdown.clone());
+    let observe = async {
+        let result: TestResult = async {
+            for (handle, diagnostic) in invalid {
+                let error = handle
+                    .await_result(&test.client, Some(Duration::from_secs(3)))
+                    .await
+                    .expect_err("malformed parameters must fail");
+                let Error::TaskFailed { task_id, failure } = error else {
+                    panic!("unexpected error: {error:?}")
+                };
+                assert_eq!(task_id, handle.result.task_id.as_uuid());
+                let failure = failure.expect("persisted failure");
+                assert_eq!(failure["name"], "elephant_error");
+                let message = failure["message"].as_str().expect("failure message");
+                assert!(
+                    message.contains("job decoding failed") && message.contains(diagnostic),
+                    "{message}"
+                );
+                assert_eq!(
+                    task_row(&test.client, handle.result.task_id).await?["attempts"],
+                    1
+                );
+            }
+            assert_eq!(
+                &*valid
+                    .await_result(&test.client, Some(Duration::from_secs(3)))
+                    .await?,
+                "pong"
+            );
+            Ok(())
+        }
+        .await;
+        shutdown.cancel();
+        result
+    };
+    timeout(Duration::from_secs(8), async {
+        let (worker, observed) = tokio::join!(worker, observe);
+        worker?;
+        observed
+    })
+    .await??;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 /// Replays saved results across both failed attempts and durable suspension.
