@@ -7,7 +7,7 @@ use elephant::{
     context::TaskContext,
     error::Error,
     task::{AbsurdJob, Router},
-    types::TaskId,
+    types::{CancellationPolicy, CreateQueueOptions, RetryStrategy, TaskId},
 };
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
@@ -233,9 +233,82 @@ async fn enum_variants_preserve_wire_shapes_and_typed_results() -> TestResult {
 /// Retains queue selection and every existing spawn option.
 #[tokio::test]
 async fn enum_jobs_preserve_spawn_options_and_queue_selection() -> TestResult {
-    todo!(
-        "Verify client defaults, explicit queues, missing queues, headers, attempts, retries, cancellation, and idempotent submission"
-    )
+    let test = setup().await?;
+    let client = Client::builder(test.client.pool().clone())
+        .default_queue("default")?
+        .default_max_attempts(3)
+        .build();
+    let default = client.spawn_job(Job::Ping).send().await?;
+    assert_eq!(default.queue_name.as_str(), "default");
+    assert_eq!(
+        task_row(&client, default.result.task_id).await?["max_attempts"],
+        3
+    );
+    let configured = client
+        .spawn_job(Job::Ping)
+        .max_attempts(7)
+        .retry_strategy(RetryStrategy::Fixed {
+            base: Duration::from_secs(2),
+        })
+        .cancellation(CancellationPolicy {
+            max_duration: Some(Duration::from_secs(120)),
+            max_delay: Some(Duration::from_secs(60)),
+        })
+        .headers(json!({"traceparent": "enum-trace"}))?
+        .idempotency_key("one-ping")
+        .send()
+        .await?;
+    let row = task_row(&client, configured.result.task_id).await?;
+    assert_eq!(row["max_attempts"], 7);
+    assert_eq!(
+        row["retry_strategy"],
+        json!({"kind": "fixed", "base_seconds": 2.0})
+    );
+    assert_eq!(
+        row["cancellation"],
+        json!({"max_duration": 120, "max_delay": 60})
+    );
+    assert_eq!(row["headers"], json!({"traceparent": "enum-trace"}));
+    let duplicate = client
+        .spawn_job(Job::Count(99))
+        .idempotency_key("one-ping")
+        .send()
+        .await?;
+    assert_eq!(duplicate.result.task_id, configured.result.task_id);
+    assert!(!duplicate.result.created);
+    assert_eq!(
+        task_row(&client, duplicate.result.task_id).await?["task_name"],
+        "Ping"
+    );
+
+    client
+        .create_queue("other", CreateQueueOptions::default())
+        .await?;
+    let overridden = client.spawn_job(Job::Ping).queue("other")?.send().await?;
+    assert_eq!(overridden.queue_name.as_str(), "other");
+    let stored: String =
+        sqlx::query_scalar("SELECT task_name FROM absurd.t_other WHERE task_id = $1")
+            .bind(overridden.result.task_id.as_uuid())
+            .fetch_one(client.pool())
+            .await?;
+    assert_eq!(stored, "Ping");
+    let unconfigured = Client::builder(client.pool().clone()).build();
+    assert!(matches!(
+        unconfigured.spawn_job(Job::Ping).send().await,
+        Err(Error::InvalidName { kind: "queue", .. })
+    ));
+    assert!(matches!(
+        client.spawn_job(Job::Ping).queue("missing")?.send().await,
+        Err(Error::Sqlx { .. })
+    ));
+    assert!(
+        !client
+            .list_queues()
+            .await?
+            .iter()
+            .any(|queue| queue.as_str() == "missing")
+    );
+    Ok(())
 }
 
 /// Keeps business mutations and enum enqueueing in the caller's transaction.
