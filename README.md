@@ -27,6 +27,7 @@ echo "SELECT absurd.create_queue('reports');" \
 
 ```rust
 // jobs.rs
+use elephant::task::AbsurdJob;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -38,11 +39,18 @@ pub enum ReportJob {
     },
     DeleteReport {
         report_key: String,
-    }
+    },
+}
+
+impl AbsurdJob for ReportJob {
+    /// Returns a message to show the user.
+    type Output = Box<str>;
 }
 ```
 
-Now we can set up a client and use it to enqueue jobs:
+`AbsurdJob::Output` defines the result type shared by the client and worker, here it is a user-facing message.
+
+Set up a client, enqueue a job, and await its result:
 
 ```rust
 // client.rs
@@ -54,13 +62,16 @@ use jobs::ReportJob;
 let pool = PgPool::connect("postgresql://localhost/myapp").await?;
 let client = Client::builder(pool).default_queue("reports")?.build();
 
-client
+let spawned = client
     .spawn_job(ReportJob::GenerateReport {
         customer_id: 123,
         year: 2026,
     })
     .send()
     .await?;
+
+let message: Box<str> = spawned.await_result(&client, None).await?;
+println!("{message}");
 ```
 
 Now we can implement the worker code:
@@ -75,7 +86,7 @@ use jobs::ReportJob;
 use reports::{calculate, delete_report, load_data, render_pdf};
 
 /// Executes a report job using durable steps.
-async fn handle_job(context: TaskContext, job: ReportJob) -> Result<()> {
+async fn handle_job(context: TaskContext, job: ReportJob) -> Result<Box<str>> {
     match job {
         ReportJob::GenerateReport { customer_id, year } => {
             let data = context
@@ -87,12 +98,14 @@ async fn handle_job(context: TaskContext, job: ReportJob) -> Result<()> {
             let report_key = format!("reports/{customer_id}/{year}.pdf");
             context
                 .step("render-pdf", || render_pdf(&aggregates, &report_key))
-                .await
+                .await?;
+            Ok(format!("Report {report_key} is ready.").into_boxed_str())
         }
         ReportJob::DeleteReport { report_key } => {
             context
                 .step("delete-report", || delete_report(&report_key))
-                .await
+                .await?;
+            Ok(format!("Report {report_key} was deleted.").into_boxed_str())
         }
     }
 }
