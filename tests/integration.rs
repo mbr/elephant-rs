@@ -4,6 +4,8 @@
 mod coverage;
 #[path = "integration/enum_jobs.rs"]
 mod enum_jobs;
+#[path = "integration/handoff.rs"]
+mod handoff;
 #[path = "integration/operations.rs"]
 mod operations;
 #[path = "integration/references.rs"]
