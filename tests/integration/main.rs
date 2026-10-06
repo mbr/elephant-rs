@@ -1,16 +1,10 @@
 //! Integration tests against ephemeral PostgreSQL.
 
-#[path = "integration/coverage.rs"]
 mod coverage;
-#[path = "integration/enum_jobs.rs"]
 mod enum_jobs;
-#[path = "integration/handoff.rs"]
 mod handoff;
-#[path = "integration/operations.rs"]
 mod operations;
-#[path = "integration/references.rs"]
 mod references;
-#[path = "integration/regressions.rs"]
 mod regressions;
 
 use std::{
@@ -104,7 +98,7 @@ async fn setup_with_max_connections(
         .max_connections(max_connections)
         .connect(db.as_str())
         .await?;
-    pool.execute(sqlx::raw_sql(include_str!("../testdata/absurd.sql")))
+    pool.execute(sqlx::raw_sql(include_str!("../../testdata/absurd.sql")))
         .await?;
     let mut builder = Client::builder(pool);
     builder.default_queue(QueueName::from_static("default"));
@@ -333,8 +327,9 @@ async fn checkpoint_replay_skips_completed_step() -> Result<(), Box<dyn StdError
 /// Verifies replay of Go checkpoints and matching Rust-written wire formats.
 #[tokio::test]
 async fn checkpoints_interoperate_with_go() -> TestResult {
-    let fixture: BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(include_str!("../testdata/go-checkpoints/checkpoints.json"))?;
+    let fixture: BTreeMap<String, serde_json::Value> = serde_json::from_str(include_str!(
+        "../../testdata/go-checkpoints/checkpoints.json"
+    ))?;
     for replay in [false, true] {
         let test = setup().await?;
         let expected = fixture.clone();
