@@ -32,8 +32,8 @@ use elephant::{
     schema,
     task::{Router, Task},
     types::{
-        CreateQueueOptions, PgInterval, QueueDetachMode, QueuePolicyOptions, RetryStrategy,
-        SpawnOptions, TaskResultSnapshot, TaskResultState,
+        CreateQueueOptions, PgInterval, QueueDetachMode, QueueName, QueuePolicyOptions,
+        RetryStrategy, SpawnOptions, TaskResultSnapshot, TaskResultState,
     },
     worker::{WorkerOptions, work_batch},
 };
@@ -107,7 +107,7 @@ async fn setup_with_max_connections(
     pool.execute(sqlx::raw_sql(include_str!("../testdata/absurd.sql")))
         .await?;
     let mut builder = Client::builder(pool);
-    builder.default_queue("default")?;
+    builder.default_queue(QueueName::from_static("default"));
     let client = builder.build();
     client
         .create_queue("default", CreateQueueOptions::default())
@@ -1608,7 +1608,7 @@ async fn cancelled_lease_stops_handler() -> TestResult {
 async fn worker_uses_client_default_queue() -> TestResult {
     let test = setup().await?;
     let mut builder = Client::builder(test.client.pool().clone());
-    builder.default_queue("workers")?;
+    builder.default_queue(QueueName::from_static("workers"));
     let client = builder.build();
     client
         .create_queue("workers", CreateQueueOptions::default())

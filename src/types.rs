@@ -1,6 +1,6 @@
 //! Shared types for queues, tasks, policies, and results.
 
-use std::{fmt, marker::PhantomData, str::FromStr, time::Duration};
+use std::{borrow::Cow, fmt, marker::PhantomData, str::FromStr, time::Duration};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::Value;
@@ -14,7 +14,7 @@ pub const MAX_QUEUE_NAME_BYTES: usize = 57;
 /// Represents a validated queue name.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(try_from = "String")]
-pub struct QueueName(String);
+pub struct QueueName(Cow<'static, str>);
 
 impl TryFrom<String> for QueueName {
     /// Validates a deserialized queue name.
@@ -26,6 +26,20 @@ impl TryFrom<String> for QueueName {
 }
 
 impl QueueName {
+    /// Creates a queue name from a static string.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the name is empty or exceeds [`MAX_QUEUE_NAME_BYTES`].
+    pub const fn from_static(value: &'static str) -> Self {
+        assert!(!value.is_empty(), "queue name must not be empty");
+        assert!(
+            value.len() <= MAX_QUEUE_NAME_BYTES,
+            "queue name is too long"
+        );
+        Self(Cow::Borrowed(value))
+    }
+
     /// Returns the queue name as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -33,7 +47,7 @@ impl QueueName {
 
     /// Consumes the queue name into its string.
     pub fn into_string(self) -> String {
-        self.0
+        self.0.into_owned()
     }
 }
 
@@ -42,7 +56,8 @@ impl FromStr for QueueName {
     type Err = Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        validate_named("queue", value, Some(MAX_QUEUE_NAME_BYTES)).map(Self)
+        validate_named("queue", value, Some(MAX_QUEUE_NAME_BYTES))
+            .map(|value| Self(Cow::Owned(value)))
     }
 }
 
@@ -899,6 +914,36 @@ mod tests {
             let decoded: TaskResultSnapshot =
                 serde_json::from_value(encoded).expect("snapshot should decode");
             assert_eq!(decoded, snapshot);
+        }
+    }
+
+    /// Preserves queue names across static construction, parsing, and serde.
+    #[test]
+    fn static_queue_names_round_trip() {
+        const QUEUE: QueueName = QueueName::from_static("reports");
+        const LIMIT: QueueName =
+            QueueName::from_static("012345678901234567890123456789012345678901234567890123456");
+
+        assert_eq!(LIMIT.as_str().len(), MAX_QUEUE_NAME_BYTES);
+        assert_eq!(QUEUE, "reports".parse::<QueueName>().expect("valid queue"));
+        let encoded = serde_json::to_string(&QUEUE).expect("queue should serialize");
+        assert_eq!(encoded, "\"reports\"");
+        let decoded: QueueName = serde_json::from_str(&encoded).expect("queue should decode");
+        assert_eq!(decoded, QUEUE);
+        assert_eq!(decoded.into_string(), QUEUE.into_string());
+    }
+
+    /// Rejects invalid static queue names when called at runtime.
+    #[test]
+    fn static_queue_names_reject_invalid_names() {
+        for name in [
+            "",
+            "0123456789012345678901234567890123456789012345678901234567",
+            "01234567890123456789012345678901234567890123456789012345\u{e9}",
+        ] {
+            assert!(name.parse::<QueueName>().is_err());
+            assert!(serde_json::from_value::<QueueName>(serde_json::json!(name)).is_err());
+            assert!(std::panic::catch_unwind(|| QueueName::from_static(name)).is_err());
         }
     }
 

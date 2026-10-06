@@ -15,8 +15,8 @@ use elephant::{
     run::{ExecutionOptions, StallTimeout},
     task::{AbsurdJob, Router, Task, TaskExecution},
     types::{
-        CancellationPolicy, CreateQueueOptions, PgInterval, QueuePolicyOptions, RetryStrategy,
-        RunId, SpawnOptions, Spawned, TaskId, TaskResultState,
+        CancellationPolicy, CreateQueueOptions, PgInterval, QueueName, QueuePolicyOptions,
+        RetryStrategy, RunId, SpawnOptions, Spawned, TaskId, TaskResultState,
     },
     worker::{ClaimOptions, work_batch},
 };
@@ -265,7 +265,9 @@ fn panic_in_wrapper(_context: TaskContext, _execute: TaskExecution) -> TaskExecu
 async fn enum_envelopes_are_validated_before_database_access() -> TestResult {
     let pool = PgPoolOptions::new().connect_lazy("postgresql://localhost/unused")?;
     pool.close().await;
-    let client = Client::builder(pool).default_queue("default")?.build();
+    let client = Client::builder(pool)
+        .default_queue(QueueName::from_static("default"))
+        .build();
     for value in [
         Value::Null,
         json!([]),
@@ -394,7 +396,7 @@ async fn enum_variants_preserve_wire_shapes_and_typed_results() -> TestResult {
 async fn enum_jobs_preserve_spawn_options_and_queue_selection() -> TestResult {
     let test = setup().await?;
     let client = Client::builder(test.client.pool().clone())
-        .default_queue("default")?
+        .default_queue(QueueName::from_static("default"))
         .default_max_attempts(3)
         .build();
     let default = client.spawn_job(Job::Ping).send().await?;

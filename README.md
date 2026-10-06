@@ -33,8 +33,10 @@ echo "SELECT absurd.create_queue('reports');" \
 
 ```rust
 // jobs.rs
-use elephant::task::AbsurdJob;
+use elephant::{task::AbsurdJob, types::QueueName};
 use serde::{Deserialize, Serialize};
+
+pub const REPORTS: QueueName = QueueName::from_static("reports");
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "task", content = "params")]  // IMPORTANT
@@ -63,10 +65,10 @@ Set up a client, enqueue a job, and await its result:
 use elephant::client::Client;
 use sqlx::PgPool;
 
-use jobs::ReportJob;
+use jobs::{REPORTS, ReportJob};
 
 let pool = PgPool::connect("postgresql://localhost/myapp").await?;
-let client = Client::builder(pool).default_queue("reports")?.build();
+let client = Client::builder(pool).default_queue(REPORTS).build();
 
 let spawned = client
     .spawn_job(ReportJob::GenerateReport {
@@ -88,7 +90,7 @@ use elephant::{client::Client, context::TaskContext, error::Result, task::Router
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use jobs::ReportJob;
+use jobs::{REPORTS, ReportJob};
 use reports::{calculate, delete_report, load_data, render_pdf};
 
 /// Executes a report job using durable steps.
@@ -120,7 +122,7 @@ async fn handle_job(context: TaskContext, job: ReportJob) -> Result<Box<str>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let pool = PgPool::connect("postgresql://localhost/myapp").await?;
-    let client = Client::builder(pool).default_queue("reports")?.build();
+    let client = Client::builder(pool).default_queue(REPORTS).build();
     let router = Router::from_job_handler(handle_job);
 
     client

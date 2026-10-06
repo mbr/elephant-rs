@@ -756,9 +756,9 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     /// Sets the default queue.
-    pub fn default_queue(&mut self, queue_name: impl AsRef<str>) -> Result<&mut Self> {
-        self.default_queue = Some(QueueName::from_str(queue_name.as_ref())?);
-        Ok(self)
+    pub fn default_queue(&mut self, queue_name: QueueName) -> &mut Self {
+        self.default_queue = Some(queue_name);
+        self
     }
 
     /// Sets default maximum attempts.

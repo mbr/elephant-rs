@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `QueueName::from_static` for const construction of validated queue names.
+
+### Changed
+
+- **Breaking:** `ClientBuilder::default_queue` now accepts a `QueueName` and returns `&mut Self` instead of `Result<&mut Self>`.
+
 ## [0.2.0] - 2026-09-30
 
 ### Changed

@@ -13,8 +13,8 @@ use elephant::{
     error::Error,
     task::{Router, Task},
     types::{
-        CancellationPolicy, CreateQueueOptions, QueueDetachMode, QueuePolicy, QueuePolicyOptions,
-        QueueStorageMode, RetryStrategy, TaskId, TaskResultState,
+        CancellationPolicy, CreateQueueOptions, QueueDetachMode, QueueName, QueuePolicy,
+        QueuePolicyOptions, QueueStorageMode, RetryStrategy, TaskId, TaskResultState,
     },
     worker::{WorkerOptions, run_worker, work_batch},
 };
@@ -178,7 +178,9 @@ async fn permissive_queue_names() -> TestResult {
 async fn retry_limit_precedence() -> TestResult {
     let test = setup().await?;
     let mut builder = Client::builder(test.client.pool().clone());
-    builder.default_queue("default")?.default_max_attempts(2);
+    builder
+        .default_queue(QueueName::from_static("default"))
+        .default_max_attempts(2);
     let client = builder.build();
     for (index, limit) in [2, 3, 4].into_iter().enumerate() {
         let calls = Arc::new(AtomicUsize::new(0));
